@@ -1,0 +1,32 @@
+[
+    {
+        "fileName": "VID20250904234404.mp4",
+        "deviceId": "AP3A.240617.008",
+        "deviceName": "AP3A.240617.008",
+        "uploadTime": "2025-10-04T18:15:26.445815",
+        "tags": [
+            "bar",
+            "celebration",
+            "event",
+            "people",
+            "party",
+            "balloons",
+            "restaurant",
+            "baru",
+            "neon sign",
+            "table",
+            "emb_367",
+            "emb_368",
+            "emb_369",
+            "person:pankaj",
+            "gathering",
+            "social"
+        ],
+        "aspectRatio": 1.0,
+        "type": "video",
+        "aiModel": "qwen2.5-vl",
+        "creationTime": "2025-09-04T18:14:25.000",
+        "description": "The image depicts a lively scene inside what appears to be an indoor venue, likely a bar or event space. The setting is vibrant and festive, with numerous red balloons arranged in the background, creating a celebratory atmosphere. These balloons are tied together at different heights along the wall, forming a decorative arch that adds depth to the composition.\n\nThe lighting within the room is warm and inviting, emanating from multiple sources including chandeliers hanging from the ceiling and ambient light fixtures embedded into the walls. The chandelier features numerous spherical bulbs arranged in a circular pattern, emitting soft white light which contrasts nicely with the red balloons above them.\n\nA group of people are gathered around what seems to be a bar counter or table at the center of the room. Several individuals appear to be engaged in an activity involving cups placed on their heads; this could suggest a game or challenge being played during the event, possibly related to the celebratory nature suggested by the balloons and decorations.\n\nThe walls have a modern design with textured patterns that add visual interest without overwhelming the space. The bar counter itself is dark-colored marble-like material which reflects some light from above while also serving as part of an interactive element in this setting.\n \nIn terms of people, there are at least ten individuals visible within the frame; they seem to be a mix of men and women dressed casually yet stylishly for what could be considered semi-formal attire. Their expressions range from focused on their task (the cup game) to smiling or laughing as if enjoying themselves.\n\nThe existing tags \"baru,\" along with other tags like \"emb_367\", \"emb_368\", \"emb_369\" and \"person:pankaj,\" suggest that this image might have been taken at a location named BARU, possibly an establishment associated with the mentioned individuals or events. These tags could be placeholders for specific details about the event or participants but do not provide explicit information regarding their identities.\n\nOverall, it seems like a social gathering taking place in a modern bar environment where people are participating actively and enjoying themselves amidst festive decorations.",
+        "descriptionState": "Persona"
+    }
+]

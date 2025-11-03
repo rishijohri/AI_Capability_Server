@@ -1,0 +1,243 @@
+# AI Capability - AI Server Backend
+
+A comprehensive, modular backend AI server with RAG (Retrieval Augmented Generation), Vision processing, and Chat capabilities. Built for easy deployment with PyInstaller.
+
+## 🎯 Quick Start
+
+```bash
+# 1. Activate virtual environment
+source venv/bin/activate
+
+# 2. Validate setup
+python validate.py
+
+# 3. Run the server
+python run_server.py
+```
+
+Server will start at: **http://127.0.0.1:8000**  
+API docs available at: **http://127.0.0.1:8000/docs**
+
+## 📚 Documentation
+
+- **[QUICKSTART.md](QUICKSTART.md)** - Quick start guide for immediate usage
+- **[README_AI_SERVER.md](README_AI_SERVER.md)** - Comprehensive documentation
+- **[PROJECT_SUMMARY.md](PROJECT_SUMMARY.md)** - Technical overview and architecture
+
+## ✨ Features
+
+- ✅ **Configuration Management** - Flexible REST API configuration
+- ✅ **RAG Database** - FAISS-based vector search with PCA reduction
+- ✅ **Embedding Generation** - LLM-powered embedding creation
+- ✅ **Vision Processing** - Image/video tagging and description
+- ✅ **Chat with Context** - Conversational AI with RAG integration
+- ✅ **WebSocket Support** - Real-time progress and streaming
+- ✅ **Modular Architecture** - Easy component replacement
+
+## 🏗️ Project Structure
+
+```
+AI_Capability/
+├── app/                      # Main application
+│   ├── config/              # Configuration management
+│   ├── models/              # Data models
+│   ├── services/            # Business logic (LLM, RAG, Vision)
+│   ├── api/                 # REST & WebSocket endpoints
+│   └── utils/               # Utilities
+├── binary/                   # Llama binaries (user to add)
+├── model/                    # Model files (user to add)
+├── venv/                     # Python virtual environment
+├── run_server.py            # Server startup
+├── validate.py              # Setup validation
+├── build.sh                 # Build script
+├── example_client.py        # Example client
+└── ai_server.spec          # PyInstaller spec
+```
+
+## 🚀 Building Executable
+
+```bash
+# Using build script
+./build.sh
+
+# Or manually
+pyinstaller ai_server.spec
+
+# Run executable
+./dist/ai_server/ai_server
+```
+
+## 📋 Prerequisites
+
+### Required
+- Python 3.8+
+- Llama binaries in `binary/` folder:
+  - `llama-server`
+  - `llama-cli`
+  - `llama-mtmd-cli`
+- Model files (.gguf) in `model/` folder
+- MMProj files for vision models
+
+### Already Installed
+All Python dependencies are installed in the virtual environment:
+- FastAPI & Uvicorn
+- WebSockets & aiohttp
+- Pillow & OpenCV
+- NumPy & scikit-learn
+- FAISS (CPU version)
+- Pydantic
+
+## 🎮 API Endpoints
+
+| Endpoint | Type | Description |
+|----------|------|-------------|
+| `/api/config` | GET/POST | Get/update configuration |
+| `/api/set-storage-metadata` | POST | Set metadata JSON path |
+| `/api/load-rag` | POST | Load RAG database |
+| `/api/generate-embeddings` | WebSocket | Generate embeddings |
+| `/api/generate-rag` | WebSocket | Build RAG database |
+| `/api/tag` | WebSocket | Tag images/videos |
+| `/api/describe` | WebSocket | Describe images/videos |
+| `/api/chat` | WebSocket | Chat with RAG context |
+
+## 🔧 Configuration
+
+Default configuration includes:
+- **Image Quality**: medium (512/1024/2048px or original)
+- **LLM Mode**: server (or cli)
+- **Top K**: 5 RAG results
+- **Recency Bias**: 1.0 (no bias)
+- **Embedding Reduction**: None (can set to 512 or other)
+- **LLM Parameters**: ctx_size, temp, top_p, etc.
+
+Update via `/api/config` endpoint or config files.
+
+## 📖 Usage Example
+
+```python
+import asyncio
+import websockets
+import json
+
+async def chat():
+    uri = "ws://127.0.0.1:8000/api/chat"
+    async with websockets.connect(uri) as ws:
+        # Initialize
+        await ws.send(json.dumps({
+            "chat_model": "your-model.gguf"
+        }))
+        
+        # Wait for ready
+        while True:
+            msg = json.loads(await ws.receive())
+            if "ready" in msg['message'].lower():
+                break
+        
+        # Send message
+        await ws.send(json.dumps({
+            "message": "What photos do I have?"
+        }))
+        
+        # Get response
+        while True:
+            msg = json.loads(await ws.receive())
+            if msg['type'] == 'result':
+                print(msg['data']['response'])
+                break
+
+asyncio.run(chat())
+```
+
+See `example_client.py` for more examples.
+
+## 🧪 Validation
+
+Run validation script to check setup:
+
+```bash
+python validate.py
+```
+
+This checks:
+- ✅ Python dependencies
+- ✅ Application structure
+- ✅ Module imports
+- ✅ Required directories
+- ✅ Binaries and models
+- ✅ Server creation
+
+## 🏗️ Architecture Highlights
+
+### Modular Design
+- **Abstract Interfaces**: Easy to swap Vector DB or LLM backend
+- **Service Layer**: Clean separation of concerns
+- **Configuration Manager**: Centralized settings with validation
+- **Process Manager**: Safe external process lifecycle
+
+### Technology Stack
+- **FastAPI**: Modern async web framework
+- **FAISS**: Efficient vector similarity search
+- **Pillow + OpenCV**: Image/video processing
+- **scikit-learn**: PCA dimensionality reduction
+- **WebSockets**: Real-time bidirectional communication
+
+## 📊 Key Components
+
+### LLM Service
+- Supports llama-server (persistent) and llama-cli (on-demand)
+- Abstract backend interface for easy replacement
+- Automatic model loading/unloading
+- Embedding and generation support
+
+### RAG Service
+- FAISS-based vector database
+- Optional PCA dimensionality reduction
+- Recency bias for time-aware ranking
+- Hybrid search (embedding + keywords)
+- Modular VectorDB interface
+
+### Vision Service
+- Image and video support
+- Quality-based preprocessing (LANCZOS)
+- Tag and description generation
+- Frame extraction from videos
+
+## 🔒 Resource Management
+
+- Automatic model cleanup after requests
+- Graceful process termination
+- WebSocket connection handling
+- Memory-efficient streaming
+
+## 🤝 Contributing
+
+The modular architecture makes it easy to:
+- Replace FAISS with another Vector DB
+- Add new LLM backends
+- Extend image processing
+- Add new API endpoints
+
+## 📝 License
+
+[Your License Here]
+
+## 🆘 Support
+
+1. Check validation: `python validate.py`
+2. Read documentation: `README_AI_SERVER.md`
+3. Try examples: `example_client.py`
+4. View API docs: http://127.0.0.1:8000/docs
+
+## 🎉 Status
+
+**✅ Production Ready**
+
+All features implemented and tested:
+- Configuration management
+- Storage metadata handling
+- Embedding generation with PCA
+- FAISS-based RAG
+- Vision processing (tag/describe)
+- Chat with RAG context
+- WebSocket real-time updates
+- PyInstaller build support
