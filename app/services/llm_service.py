@@ -303,13 +303,17 @@ class LlamaCLIBackend(LLMBackend):
         self.model_path: Optional[Path] = None
         self._binary_path: Optional[Path] = None
         self.startup_command: Optional[List[str]] = None
+        self._embed_binary_path: Optional[Path] = None
         self._mmproj_path: Optional[Path] = None
-    
+        self._vision_binary_path: Optional[Path] = None
+        self._current_process: Optional[asyncio.subprocess.Process] = None
+        self._process_lock = asyncio.Lock()
     async def start(self, model_path: Path, **kwargs) -> None:
         """Prepare llama-cli (no persistent process)."""
         config = get_config()
+        self._vision_binary_path = config.get_binary_path("llama-mtmd-cli")
         self._binary_path = config.get_binary_path("llama-cli")
-        
+        self._embed_binary_path = config.get_binary_path("llama-embedding")
         if not self._binary_path.exists():
             raise FileNotFoundError(f"llama-cli binary not found: {self._binary_path}")
         
@@ -351,8 +355,30 @@ class LlamaCLIBackend(LLMBackend):
         return None
     
     async def stop(self) -> None:
-        """No-op for CLI backend."""
+        """Stop CLI backend and cancel any running process."""
+        await self.cancel_generation()
         self.model_path = None
+    
+    async def cancel_generation(self) -> None:
+        """Cancel any running generation process."""
+        async with self._process_lock:
+            if self._current_process is not None:
+                try:
+                    # Try graceful termination first
+                    self._current_process.terminate()
+                    try:
+                        await asyncio.wait_for(self._current_process.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        # Force kill if graceful termination times out
+                        self._current_process.kill()
+                        await self._current_process.wait()
+                except ProcessLookupError:
+                    # Process already terminated
+                    pass
+                except Exception as e:
+                    print(f"Error cancelling CLI process: {e}")
+                finally:
+                    self._current_process = None
     
     async def generate(
         self,
@@ -389,57 +415,119 @@ class LlamaCLIBackend(LLMBackend):
         if self._mmproj_path:
             command.extend(["--mmproj", str(self._mmproj_path)])
         
-        # Run process
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
+        # Run process with tracking
+        async with self._process_lock:
+            self._current_process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            process = self._current_process
         
-        # Read output
-        stdout, stderr = await process.communicate()
-        
-        if process.returncode != 0:
-            raise RuntimeError(f"llama-cli failed: {stderr.decode()}")
-        
-        # Yield full response
-        yield stdout.decode().strip()
+        try:
+            # Read output
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                # Check if it was cancelled (negative return codes indicate signals)
+                if process.returncode < 0:
+                    raise asyncio.CancelledError("Generation was cancelled")
+                raise RuntimeError(f"llama-cli failed: {stderr.decode()}")
+            
+            # Yield full response
+            yield stdout.decode().strip()
+        finally:
+            # Clean up process reference
+            async with self._process_lock:
+                if self._current_process == process:
+                    self._current_process = None
     
     async def embed(self, text: str) -> List[float]:
         """Generate embedding using llama-cli with embedding flag."""
         if not self.model_path:
             raise RuntimeError("Model not loaded")
-        
+        # Ensure embed binary path is available (start() normally sets this)
+        config = get_config()
+        if not self._embed_binary_path:
+            self._embed_binary_path = config.get_binary_path("llama-embedding")
+
         command = [
-            str(self._binary_path),
+            str(self._embed_binary_path),
             "--model", str(self.model_path),
-            "--prompt", text,
-            "--embedding"
+            "--prompt", text
         ]
         
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
+        async with self._process_lock:
+            self._current_process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            process = self._current_process
         
-        stdout, stderr = await process.communicate()
-        
-        if process.returncode != 0:
-            raise RuntimeError(f"llama-cli embedding failed: {stderr.decode()}")
-        
-        # Parse embedding from output
+        try:
+            stdout, stderr = await process.communicate()
+
+            if process.returncode != 0:
+                # Check if it was cancelled
+                if process.returncode < 0:
+                    raise asyncio.CancelledError("Embedding generation was cancelled")
+                raise RuntimeError(f"llama-cli embedding failed: {stderr.decode()}")
+        finally:
+            async with self._process_lock:
+                if self._current_process == process:
+                    self._current_process = None
+
+        # Parse embedding from output (support multiple formats)
         output = stdout.decode().strip()
+
+        # 1) Try JSON first
         try:
             embedding = json.loads(output)
-            return embedding
-        except json.JSONDecodeError:
-            # Try to extract JSON array from output
-            import re
-            match = re.search(r'\[[\d\s,.-]+\]', output)
-            if match:
-                return json.loads(match.group(0))
-            raise ValueError(f"Failed to parse embedding from output: {output}")
+            # If top-level is a dict with 'data' or 'embedding', normalize it
+            if isinstance(embedding, dict):
+                if 'data' in embedding and len(embedding['data']) > 0:
+                    return embedding['data'][0].get('embedding', embedding['data'][0])
+                if 'embedding' in embedding:
+                    return embedding['embedding']
+                if 'embeddings' in embedding and len(embedding['embeddings']) > 0:
+                    return embedding['embeddings'][0]
+                # Unexpected dict shape; fallthrough to other parsing
+            elif isinstance(embedding, list):
+                return embedding
+        except Exception:
+            # Not JSON or different structure; try textual parsing below
+            pass
+
+        # 2) Try to find a JSON array substring anywhere in output (e.g., [0.1, 0.2])
+        import re
+        json_array_match = re.search(r'\[[\s\d+\-eE.,]+\]', output)
+        if json_array_match:
+            try:
+                return json.loads(json_array_match.group(0))
+            except Exception:
+                # continue to other heuristics
+                pass
+
+        # 3) Look for lines like: 'embedding 0:  0.001452  0.001441  0.017390 ...'
+        # Extract numbers from the first such line (or entire output if no prefix)
+        # Find lines that contain the word 'embedding' and numbers
+        for line in output.splitlines():
+            if 'embedding' in line.lower():
+                # Remove the leading 'embedding ...:' prefix
+                parts = re.split(r'embedding\s*\d*\s*:\s*', line, flags=re.IGNORECASE)
+                numeric_part = parts[-1] if parts else line
+                nums = re.findall(r'[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?', numeric_part)
+                if nums:
+                    return [float(x) for x in nums]
+
+        # 4) As a last resort, extract all floats from the entire output
+        nums = re.findall(r'[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?', output)
+        if nums:
+            return [float(x) for x in nums]
+
+        # If nothing parsed, raise with helpful diagnostics
+        raise ValueError(f"Failed to parse embedding from output: {output}")
     
     async def generate_vision(
         self,
@@ -491,19 +579,29 @@ class LlamaCLIBackend(LLMBackend):
                 if mmproj_path.exists():
                     command.extend(["--mmproj", str(mmproj_path)])
             
-            # Execute command
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
+            # Execute command with tracking
+            async with self._process_lock:
+                self._current_process = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                process = self._current_process
             
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode != 0:
-                raise RuntimeError(f"Vision model failed: {stderr.decode()}")
-            
-            return stdout.decode().strip()
+            try:
+                stdout, stderr = await process.communicate()
+                
+                if process.returncode != 0:
+                    # Check if it was cancelled
+                    if process.returncode < 0:
+                        raise asyncio.CancelledError("Vision generation was cancelled")
+                    raise RuntimeError(f"Vision model failed: {stderr.decode()}")
+                
+                return stdout.decode().strip()
+            finally:
+                async with self._process_lock:
+                    if self._current_process == process:
+                        self._current_process = None
             
         finally:
             # Clean up temporary file

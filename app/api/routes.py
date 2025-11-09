@@ -71,6 +71,7 @@ async def get_configuration():
         vision_binary=config.vision_binary,
         backend=config.llm_mode,
         model_timeout=300,
+        llm_timeout=config.llm_timeout,
         llm_params=config.llm_params.model_dump(),
         rag_directory_name=config.rag_directory_name,
         storage_metadata_path=config.storage_metadata_path
@@ -101,6 +102,7 @@ async def update_configuration(request: ConfigUpdateRequest):
         vision_binary=config.vision_binary,
         backend=config.llm_mode,
         model_timeout=300,
+        llm_timeout=config.llm_timeout,
         llm_params=config.llm_params.model_dump(),
         rag_directory_name=config.rag_directory_name,
         storage_metadata_path=config.storage_metadata_path
@@ -272,6 +274,10 @@ async def generate_embeddings_ws(websocket: WebSocket):
     """Generate embeddings for all files (WebSocket)."""
     await websocket.accept()
     
+    # Track tasks for cancellation
+    generation_task = None
+    llm_service = None
+    
     try:
         # Receive configuration
         data = await websocket.receive_json()
@@ -281,6 +287,7 @@ async def generate_embeddings_ws(websocket: WebSocket):
         
         metadata_store = get_metadata_store()
         embedding_service = get_embedding_service()
+        llm_service = get_llm_service()
         
         # Progress callback
         async def progress_callback(current: int, total: int, filename: str):
@@ -318,12 +325,22 @@ async def generate_embeddings_ws(websocket: WebSocket):
             ).to_json()
         )
         
-        embeddings = await embedding_service.generate_embeddings(
-            metadata_store,
-            embedding_model,
-            progress_callback,
-            force_regen
-        )
+        # Wrap in task for cancellation support
+        async def generate_embeddings_task():
+            return await embedding_service.generate_embeddings(
+                metadata_store,
+                embedding_model,
+                progress_callback,
+                force_regen
+            )
+        
+        generation_task = asyncio.create_task(generate_embeddings_task())
+        try:
+            # Use a longer timeout for embeddings since they process multiple files
+            embeddings = await asyncio.wait_for(generation_task, timeout=config.llm_timeout * 10)
+        except asyncio.TimeoutError:
+            generation_task.cancel()
+            raise RuntimeError(f"Embedding generation timed out after {config.llm_timeout * 10} seconds")
         
         await websocket.send_json(
             WebSocketMessage(
@@ -333,7 +350,49 @@ async def generate_embeddings_ws(websocket: WebSocket):
             ).to_json()
         )
         
+    except WebSocketDisconnect:
+        # Client disconnected - cancel any running generation
+        if generation_task and not generation_task.done():
+            generation_task.cancel()
+            try:
+                await generation_task
+            except asyncio.CancelledError:
+                pass
+        
+        # If using CLI mode, explicitly cancel the subprocess
+        if llm_service and config.llm_mode == "cli":
+            if hasattr(llm_service.current_backend, 'cancel_generation'):
+                await llm_service.current_backend.cancel_generation()
+    except asyncio.CancelledError:
+        # Task was cancelled (likely due to disconnect)
+        if llm_service and config.llm_mode == "cli":
+            if hasattr(llm_service.current_backend, 'cancel_generation'):
+                await llm_service.current_backend.cancel_generation()
+    except asyncio.TimeoutError:
+        # Task timed out
+        if generation_task and not generation_task.done():
+            generation_task.cancel()
+        
+        if llm_service and config.llm_mode == "cli":
+            if hasattr(llm_service.current_backend, 'cancel_generation'):
+                await llm_service.current_backend.cancel_generation()
+        
+        await websocket.send_json(
+            WebSocketMessage(
+                type="error",
+                message=f"Embedding generation timed out after {config.llm_timeout * 10} seconds",
+                data={"timeout": config.llm_timeout * 10}
+            ).to_json()
+        )
     except Exception as e:
+        # Cancel task if running
+        if generation_task and not generation_task.done():
+            generation_task.cancel()
+            try:
+                await generation_task
+            except asyncio.CancelledError:
+                pass
+        
         error_details = {
             "error_type": type(e).__name__,
             "error_message": str(e),
@@ -349,6 +408,9 @@ async def generate_embeddings_ws(websocket: WebSocket):
             ).to_json()
         )
     finally:
+        # Final cleanup
+        if generation_task and not generation_task.done():
+            generation_task.cancel()
         await websocket.close()
 
 
@@ -403,6 +465,11 @@ async def tag_files_ws(websocket: WebSocket):
     """Generate tags for files (WebSocket)."""
     await websocket.accept()
     
+    # Track tasks for cancellation
+    current_task = None
+    vision_service = None
+    llm_service = None
+    
     try:
         # Receive request
         data = await websocket.receive_json()
@@ -423,6 +490,7 @@ async def tag_files_ws(websocket: WebSocket):
         
         metadata_store = get_metadata_store()
         vision_service = get_vision_service()
+        llm_service = get_llm_service()
         
         try:
             for idx, file_path_str in enumerate(file_paths):
@@ -501,15 +569,25 @@ async def tag_files_ws(websocket: WebSocket):
                             )
                             await asyncio.sleep(0.1)  # Yield control to ensure message is sent
                     
-                    thinking, tags = await vision_service.generate_tags(
-                        file_path,
-                        metadata.type,
-                        vision_model,
-                        mmproj_file,
-                        startup_callback,
-                        dimension_callback,
-                        keep_loaded=True  # Keep model loaded for batch processing
-                    )
+                    # Wrap in task for cancellation support
+                    async def generate_tags_task():
+                        return await vision_service.generate_tags(
+                            file_path,
+                            metadata.type,
+                            vision_model,
+                            mmproj_file,
+                            startup_callback,
+                            dimension_callback,
+                            keep_loaded=True  # Keep model loaded for batch processing
+                        )
+                    
+                    current_task = asyncio.create_task(generate_tags_task())
+                    try:
+                        thinking, tags = await asyncio.wait_for(current_task, timeout=config.llm_timeout)
+                    except asyncio.TimeoutError:
+                        current_task.cancel()
+                        raise RuntimeError(f"Tag generation timed out after {config.llm_timeout} seconds")
+                    current_task = None
                     
                     # Send thinking part if available
                     if thinking:
@@ -558,13 +636,62 @@ async def tag_files_ws(websocket: WebSocket):
                 )
         finally:
             # Unload model after all files are processed or on error
-            await vision_service.unload_model()
+            if vision_service:
+                await vision_service.unload_model()
         
     except WebSocketDisconnect:
+        # Client disconnected - cancel any running task
+        if current_task and not current_task.done():
+            current_task.cancel()
+            try:
+                await current_task
+            except asyncio.CancelledError:
+                pass
+        
+        # If using CLI mode, explicitly cancel the subprocess
+        if llm_service and config.llm_mode == "cli":
+            if hasattr(llm_service.current_backend, 'cancel_generation'):
+                await llm_service.current_backend.cancel_generation()
+        
         # Ensure model is unloaded on unexpected disconnect
-        await vision_service.unload_model()
-        pass
+        if vision_service:
+            await vision_service.unload_model()
+    except asyncio.CancelledError:
+        # Task was cancelled (likely due to disconnect)
+        if llm_service and config.llm_mode == "cli":
+            if hasattr(llm_service.current_backend, 'cancel_generation'):
+                await llm_service.current_backend.cancel_generation()
+        
+        if vision_service:
+            await vision_service.unload_model()
+    except asyncio.TimeoutError:
+        # Task timed out
+        if current_task and not current_task.done():
+            current_task.cancel()
+        
+        if llm_service and config.llm_mode == "cli":
+            if hasattr(llm_service.current_backend, 'cancel_generation'):
+                await llm_service.current_backend.cancel_generation()
+        
+        await websocket.send_json(
+            WebSocketMessage(
+                type="error",
+                message=f"Tag generation timed out after {config.llm_timeout} seconds",
+                data={"timeout": config.llm_timeout}
+            ).to_json()
+        )
+        
+        if vision_service:
+            await vision_service.unload_model()
     except Exception as e:
+        # Cancel task if running
+        if current_task and not current_task.done():
+            current_task.cancel()
+            try:
+                await current_task
+            except asyncio.CancelledError:
+                pass
+        
         error_details = {
             "error_type": type(e).__name__,
             "error_message": str(e),
@@ -577,7 +704,13 @@ async def tag_files_ws(websocket: WebSocket):
                 data=error_details
             ).to_json()
         )
+        
+        if vision_service:
+            await vision_service.unload_model()
     finally:
+        # Final cleanup
+        if current_task and not current_task.done():
+            current_task.cancel()
         await websocket.close()
 
 
@@ -585,6 +718,11 @@ async def tag_files_ws(websocket: WebSocket):
 async def describe_files_ws(websocket: WebSocket):
     """Generate descriptions for files (WebSocket)."""
     await websocket.accept()
+    
+    # Track tasks for cancellation
+    current_task = None
+    vision_service = None
+    llm_service = None
     
     try:
         # Receive request
@@ -606,6 +744,7 @@ async def describe_files_ws(websocket: WebSocket):
         
         metadata_store = get_metadata_store()
         vision_service = get_vision_service()
+        llm_service = get_llm_service()
         
         try:
             for idx, file_path_str in enumerate(file_paths):
@@ -684,15 +823,25 @@ async def describe_files_ws(websocket: WebSocket):
                             )
                             await asyncio.sleep(0.1)  # Yield control to ensure message is sent
                     
-                    thinking, description = await vision_service.generate_description(
-                        file_path,
-                        metadata.type,
-                        vision_model,
-                        mmproj_file,
-                        startup_callback,
-                        dimension_callback,
-                        keep_loaded=True  # Keep model loaded for batch processing
-                    )
+                    # Wrap in task for cancellation support
+                    async def generate_description_task():
+                        return await vision_service.generate_description(
+                            file_path,
+                            metadata.type,
+                            vision_model,
+                            mmproj_file,
+                            startup_callback,
+                            dimension_callback,
+                            keep_loaded=True  # Keep model loaded for batch processing
+                        )
+                    
+                    current_task = asyncio.create_task(generate_description_task())
+                    try:
+                        thinking, description = await asyncio.wait_for(current_task, timeout=config.llm_timeout)
+                    except asyncio.TimeoutError:
+                        current_task.cancel()
+                        raise RuntimeError(f"Description generation timed out after {config.llm_timeout} seconds")
+                    current_task = None
                     
                     # Send thinking part if available
                     if thinking:
@@ -741,13 +890,62 @@ async def describe_files_ws(websocket: WebSocket):
                 )
         finally:
             # Unload model after all files are processed or on error
-            await vision_service.unload_model()
+            if vision_service:
+                await vision_service.unload_model()
         
     except WebSocketDisconnect:
+        # Client disconnected - cancel any running task
+        if current_task and not current_task.done():
+            current_task.cancel()
+            try:
+                await current_task
+            except asyncio.CancelledError:
+                pass
+        
+        # If using CLI mode, explicitly cancel the subprocess
+        if llm_service and config.llm_mode == "cli":
+            if hasattr(llm_service.current_backend, 'cancel_generation'):
+                await llm_service.current_backend.cancel_generation()
+        
         # Ensure model is unloaded on unexpected disconnect
-        await vision_service.unload_model()
-        pass
+        if vision_service:
+            await vision_service.unload_model()
+    except asyncio.CancelledError:
+        # Task was cancelled (likely due to disconnect)
+        if llm_service and config.llm_mode == "cli":
+            if hasattr(llm_service.current_backend, 'cancel_generation'):
+                await llm_service.current_backend.cancel_generation()
+        
+        if vision_service:
+            await vision_service.unload_model()
+    except asyncio.TimeoutError:
+        # Task timed out
+        if current_task and not current_task.done():
+            current_task.cancel()
+        
+        if llm_service and config.llm_mode == "cli":
+            if hasattr(llm_service.current_backend, 'cancel_generation'):
+                await llm_service.current_backend.cancel_generation()
+        
+        await websocket.send_json(
+            WebSocketMessage(
+                type="error",
+                message=f"Description generation timed out after {config.llm_timeout} seconds",
+                data={"timeout": config.llm_timeout}
+            ).to_json()
+        )
+        
+        if vision_service:
+            await vision_service.unload_model()
     except Exception as e:
+        # Cancel task if running
+        if current_task and not current_task.done():
+            current_task.cancel()
+            try:
+                await current_task
+            except asyncio.CancelledError:
+                pass
+        
         error_details = {
             "error_type": type(e).__name__,
             "error_message": str(e),
@@ -760,7 +958,13 @@ async def describe_files_ws(websocket: WebSocket):
                 data=error_details
             ).to_json()
         )
+        
+        if vision_service:
+            await vision_service.unload_model()
     finally:
+        # Final cleanup
+        if current_task and not current_task.done():
+            current_task.cancel()
         await websocket.close()
 
 
@@ -769,15 +973,19 @@ async def chat_ws(websocket: WebSocket):
     """Chat with LLM using RAG (WebSocket). Supports visual conversation when enabled."""
     await websocket.accept()
     
+    # Track if we should cleanup on disconnect
+    generation_task = None
+    llm_service = None
+    
     try:
         # Get configuration
         config = get_config()
+        llm_service = get_llm_service()
         
         embedding_model = config.embedding_model
         
         metadata_store = get_metadata_store()
         rag_service = get_rag_service()
-        llm_service = get_llm_service()
         
         # Ensure RAG is loaded
         if not rag_service.is_loaded():
@@ -1006,84 +1214,109 @@ async def chat_ws(websocket: WebSocket):
         
         response_text = ""
         
-        # Use vision generation if image is provided and visual chat is enabled
-        if use_vision and image_base64:
-            # For vision models with image, use generate_vision
-            # Build image context with tags and description
-            image_context_parts = []
-            if image_tags:
-                image_context_parts.append(f"Image Tags: {', '.join(image_tags)}")
-            if image_description:
-                image_context_parts.append(f"Image Description: {image_description}")
-            
-            image_context = "\n".join(image_context_parts) if image_context_parts else ""
-            
-            # Get current date
-            current_date = datetime.now().strftime("%B %d, %Y")
-            
-            # Combine system prompt, RAG context, and image context
-            system_content = f"{config.chat_system_prompt}\n\nCurrent Date: {current_date}\n\n{context}"
-            if image_context:
-                system_content += f"\n\nImage Context:\n{image_context}"
-            
-            prompt = f"{system_content}\n\nUser: {user_message}\n\nAssistant:"
-            
-            # Convert base64 back to bytes for generate_vision
-            import base64
-            image_bytes = base64.b64decode(image_base64)
-            
-            response_text = await llm_service.generate_vision(image_bytes, prompt, mmproj_file)
-            
-            # Send as progress for consistency
-            await websocket.send_json(
-                WebSocketMessage(
-                    type="progress",
-                    message=response_text,
-                    data={"partial_response": response_text}
-                ).to_json()
-            )
-        else:
-            # Standard text-based chat
-            # Get current date
-            current_date = datetime.now().strftime("%B %d, %Y")
-            
-            # Create system message with configurable prompt and context
-            messages = [
-                {
-                    "role": "system",
-                    "content": f"{config.chat_system_prompt}\n\nCurrent Date: {current_date}\n\n{context}"
-                }
-            ] + active_history
-            
-            async for chunk in llm_service.generate(messages, stream=True):
-                response_text += chunk
+        # Create async generator wrapper to handle cancellation
+        async def generate_response():
+            nonlocal response_text
+            try:
+                # Use vision generation if image is provided and visual chat is enabled
+                if use_vision and image_base64:
+                    # For vision models with image, use generate_vision
+                    # Build image context with tags and description
+                    image_context_parts = []
+                    if image_tags:
+                        image_context_parts.append(f"Image Tags: {', '.join(image_tags)}")
+                    if image_description:
+                        image_context_parts.append(f"Image Description: {image_description}")
+                    
+                    image_context = "\n".join(image_context_parts) if image_context_parts else ""
+                    
+                    # Get current date
+                    current_date = datetime.now().strftime("%B %d, %Y")
+                    
+                    # Combine system prompt, RAG context, and image context
+                    system_content = f"{config.chat_system_prompt}\n\nCurrent Date: {current_date}\n\n{context}"
+                    if image_context:
+                        system_content += f"\n\nImage Context:\n{image_context}"
+                    
+                    prompt = f"{system_content}\n\nUser: {user_message}\n\nAssistant:"
+                    
+                    # Convert base64 back to bytes for generate_vision
+                    import base64
+                    image_bytes = base64.b64decode(image_base64)
+                    
+                    response_text = await llm_service.generate_vision(image_bytes, prompt, mmproj_file)
+                    
+                    # Send as progress for consistency
+                    await websocket.send_json(
+                        WebSocketMessage(
+                            type="progress",
+                            message=response_text,
+                            data={"partial_response": response_text}
+                        ).to_json()
+                    )
+                else:
+                    # Standard text-based chat
+                    # Get current date
+                    current_date = datetime.now().strftime("%B %d, %Y")
+                    
+                    # Create system message with configurable prompt and context
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": f"{config.chat_system_prompt}\n\nCurrent Date: {current_date}\n\n{context}"
+                        }
+                    ] + active_history
+                    
+                    async for chunk in llm_service.generate(messages, stream=True):
+                        response_text += chunk
+                        await websocket.send_json(
+                            WebSocketMessage(
+                                type="progress",
+                                message=chunk,
+                                data={"partial_response": response_text}
+                            ).to_json()
+                        )
+            except asyncio.CancelledError:
+                # Handle graceful cancellation
                 await websocket.send_json(
                     WebSocketMessage(
-                        type="progress",
-                        message=chunk,
-                        data={"partial_response": response_text}
+                        type="status",
+                        message="Generation cancelled due to client disconnect"
                     ).to_json()
                 )
+                raise
         
-        # Parse XML tags and send structured response
-        import re
+        # Run generation in a task to allow cancellation
+        generation_task = asyncio.create_task(generate_response())
         
-        # Extract content from XML tags
-        think_match = re.search(r'<think>(.*?)</think>', response_text, re.DOTALL)
-        conclusion_match = re.search(r'<conclusion>(.*?)</conclusion>', response_text, re.DOTALL)
-        files_match = re.search(r'<files>(.*?)</files>', response_text, re.DOTALL)
-        
-        # Send thinking section
-        if think_match:
-            thinking_content = think_match.group(1).strip()
+        # Wait for generation to complete with timeout
+        try:
+            await asyncio.wait_for(generation_task, timeout=config.llm_timeout)
+        except asyncio.TimeoutError:
+            generation_task.cancel()
             await websocket.send_json(
                 WebSocketMessage(
-                    type="thinking",
-                    message=thinking_content
+                    type="error",
+                    message=f"Response generation timed out after {config.llm_timeout} seconds"
                 ).to_json()
             )
+            return
         
-        # Send conclusion section
+        # Sanitize and parse structured output: strip any <think> (internal reasoning) and
+        # return only <conclusion> and <files> to clients. This prevents exposing chain-of-thought
+        # even if the model produced it.
+        import re
+
+        # Remove any internal reasoning sections from model output
+        response_sanitized = re.sub(r'<think>.*?</think>', '', response_text, flags=re.DOTALL)
+
+        # Extract content from XML tags (conclusion and files only)
+        conclusion_match = re.search(r'<conclusion>(.*?)</conclusion>', response_sanitized, re.DOTALL)
+        files_match = re.search(r'<files>(.*?)</files>', response_sanitized, re.DOTALL)
+
+        sent_any = False
+
+        # Send conclusion section if present
         if conclusion_match:
             conclusion_content = conclusion_match.group(1).strip()
             await websocket.send_json(
@@ -1092,26 +1325,42 @@ async def chat_ws(websocket: WebSocket):
                     message=conclusion_content
                 ).to_json()
             )
-        
-        # Send files section
+            sent_any = True
+
+        # Send files section if present
         if files_match:
             files_content = files_match.group(1).strip()
+            # Attempt to parse files into a list (support newline or comma separated lists)
+            files_list = []
+            if files_content:
+                # Split by newlines, commas, or dashes commonly used in examples
+                parts = re.split(r'\r?\n|,|\-', files_content)
+                for p in parts:
+                    p = p.strip()
+                    if p:
+                        # Remove any leading bullets
+                        p = re.sub(r'^[\-*]\s*', '', p)
+                        files_list.append(p)
+
             await websocket.send_json(
                 WebSocketMessage(
                     type="files",
                     message=files_content,
-                    data={"relevant_files": [f.fileName for f in relevant_files]}
+                    data={"relevant_files": files_list or [f.fileName for f in relevant_files]}
                 ).to_json()
             )
-        
-        # If no structured tags found, send as regular response
-        if not (think_match or conclusion_match or files_match):
+            sent_any = True
+
+        # If no structured tags found, send the sanitized response as a normal result
+        if not sent_any:
+            # Remove any remaining XML-like tags to avoid leaking internal formats
+            clean_response = re.sub(r'<.*?>', '', response_sanitized, flags=re.DOTALL).strip()
             await websocket.send_json(
                 WebSocketMessage(
                     type="result",
                     message="Response complete",
                     data={
-                        "response": response_text,
+                        "response": clean_response,
                         "relevant_files": [f.fileName for f in relevant_files]
                     }
                 ).to_json()
@@ -1126,21 +1375,51 @@ async def chat_ws(websocket: WebSocket):
             )
         
         # Unload model and close connection automatically after response
-        await llm_service.unload_model()
+        if llm_service:
+            await llm_service.unload_model()
         
     except WebSocketDisconnect:
+        # Client disconnected - cancel any running generation
+        if generation_task and not generation_task.done():
+            generation_task.cancel()
+            try:
+                await generation_task
+            except asyncio.CancelledError:
+                pass
+        
+        # If using CLI mode, explicitly cancel the subprocess
+        if llm_service and config.llm_mode == "cli":
+            if hasattr(llm_service.current_backend, 'cancel_generation'):
+                await llm_service.current_backend.cancel_generation()
+        
         # Clean up
-        llm_service = get_llm_service()
-        await llm_service.unload_model()
+        if llm_service:
+            await llm_service.unload_model()
+    except asyncio.CancelledError:
+        # Generation was cancelled (likely due to disconnect)
+        if llm_service and config.llm_mode == "cli":
+            if hasattr(llm_service.current_backend, 'cancel_generation'):
+                await llm_service.current_backend.cancel_generation()
+        
+        if llm_service:
+            await llm_service.unload_model()
     except Exception as e:
+        # Cancel generation task if it's running
+        if generation_task and not generation_task.done():
+            generation_task.cancel()
+            try:
+                await generation_task
+            except asyncio.CancelledError:
+                pass
+        
         # Get startup command for debugging
-        startup_command = llm_service.get_startup_command() if 'llm_service' in locals() else None
+        startup_command = llm_service.get_startup_command() if llm_service else None
         
         error_details = {
             "error_type": type(e).__name__,
             "error_message": str(e),
             "traceback": traceback.format_exc(),
-            "chat_model": data.get("chat_model") if 'data' in locals() else None,
+            "chat_model": msg_data.get("chat_model") if 'msg_data' in locals() else None,
             "startup_command": startup_command
         }
         await websocket.send_json(
@@ -1151,9 +1430,12 @@ async def chat_ws(websocket: WebSocket):
             ).to_json()
         )
         # Clean up
-        llm_service = get_llm_service()
-        await llm_service.unload_model()
+        if llm_service:
+            await llm_service.unload_model()
     finally:
+        # Ensure cleanup happens even if error during error handling
+        if generation_task and not generation_task.done():
+            generation_task.cancel()
         await websocket.close()
 
 

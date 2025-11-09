@@ -23,6 +23,7 @@ class ConfigUpdateRequest(BaseModel):
     vision_binary: Optional[Literal["auto", "llama-mtmd-cli", "llama-qwen2vl-cli"]] = None
     backend: Optional[Literal["server", "cli"]] = None
     model_timeout: Optional[int] = None
+    llm_timeout: Optional[int] = Field(None, ge=10, le=3600, description="Timeout for LLM operations in seconds")
     llm_params: Optional[Dict[str, Any]] = None
 
 

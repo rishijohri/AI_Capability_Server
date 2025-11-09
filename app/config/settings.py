@@ -11,14 +11,14 @@ from app.utils.resource_paths import get_data_directory
 
 class LLMParams(BaseModel):
     """LLM execution parameters."""
-    ctx_size: int = Field(default=12192, description="Context size")
+    ctx_size: int = Field(default=6500, description="Context size")
     temp: float = Field(default=0.35, description="Temperature")
     top_p: float = Field(default=0.9, description="Top-p sampling")
     top_k: int = Field(default=40, description="Top-k sampling")
     presence_penalty: float = Field(default=0.2, description="Presence penalty")
     mirostat: int = Field(default=0, description="Mirostat sampling")
-    batch_size: int = Field(default=8192, description="Batch size")
-    ubatch_size: int = Field(default=1024, description="Micro-batch size")
+    batch_size: int = Field(default=1024, description="Batch size")
+    ubatch_size: int = Field(default=512, description="Micro-batch size")
     n_gpu_layers: int = Field(default=999, description="Number of GPU layers to offload")
 
 model_options = [
@@ -73,11 +73,29 @@ model_options = [
             }
         },
         {
-            "name": "MiniCPM4.5",
+            "name": "MiniCPM4.5_KM",
             "type": "vision",
             # "model_file": "ggml-model-Q4_0.gguf",
             "model_file": "ggml-model-Q4_K_M.gguf",
             "mmproj_file": "mmproj-model-f16-ggml.gguf",
+            "llm_params": {
+                "ctx_size": 12192,
+                "n_gpu_layers": 99,
+                "top_k": 40,
+                "top_p": 0.9,
+                "temp": 0.35,
+                "presence_penalty": 0.2,
+                "microstat": 2,
+                "batch_size": 8192,
+                "ubatch_size": 1024
+            }
+        },
+        {
+            "name": "MiniCPM4.5_KS",
+            "type": "vision",
+            # "model_file": "ggml-model-Q4_0.gguf",
+            "model_file": "MiniCPM4-Q4_K_S.gguf",
+            "mmproj_file": "MiniCPM4_mmproj-model-f16.gguf",
             "llm_params": {
                 "ctx_size": 12192,
                 "n_gpu_layers": 99,
@@ -110,6 +128,23 @@ model_options = [
             "name": "granite4_350m",
             "type": "chat",
             "model_file": "granite-4.0-350m-UD-Q6_K_XL.gguf",
+            "llm_params": {
+                "ctx_size": 12192,
+                "n_gpu_layers": 99,
+                "top_k": 40,
+                "top_p": 0.9,
+                "temp": 0.35,
+                "presence_penalty": 0.2,
+                "microstat": 2,
+                "batch_size": 8192,
+                "ubatch_size": 1024
+            }
+        },
+        {
+            "name": "llava_phi3_4k",
+            "type": "vision",
+            "model_file": "llava-phi3-mini-Q4_K_M.gguf",
+            "mmproj_file": "llava-phi3-mini-mmproj-f16.gguf",
             "llm_params": {
                 "ctx_size": 12192,
                 "n_gpu_layers": 99,
@@ -165,6 +200,12 @@ class ServerConfig(BaseModel):
         default=True,
         description="Enable visual conversation mode (uses vision model for chat with images)"
     )
+    llm_timeout: int = Field(
+        default=300,
+        ge=10,
+        le=3600,
+        description="Timeout in seconds for LLM operations (10-3600 seconds)"
+    )
     
     # Model file names
     chat_model: str = Field(
@@ -176,62 +217,46 @@ class ServerConfig(BaseModel):
         description="Embedding model filename"
     )
     vision_model: str = Field(
-        # default="Qwen2.5-VL-7B-Instruct-UD-IQ2_M.gguf",
-        # default="ggml-model-Q4_0.gguf",
-        default = "ggml-model-Q4_K_M.gguf",
-        # default = "Qwen3-VL-8B-Thinking-IQ4_NL.gguf",
+        default = "gemma-3-4b-it-Q4_K_M.gguf",
         description="Vision model filename"
     )
     mmproj_model: str = Field(
-        # default="mmproj-F16.gguf",
-        default="mmproj-model-f16-ggml.gguf",
-        # default="mmproj-F16-qwen3vl.gguf",
+        default="gemma_3_mmproj-F16.gguf", # MiniCPM4.5
         description="MMProj model filename for vision"
     )
     
     # System prompts for different tasks
     chat_system_prompt: str = Field(
-        default="""You are Persona, a helpful AI assistant. You MUST structure EVERY response using XML tags to separate different parts of your thinking and output.
+        default="""You are Persona, a helpful AI assistant. Provide concise, factual answers and DO NOT reveal internal chain-of-thought or reasoning processes.
 
-MANDATORY FORMAT REQUIREMENTS:
-You MUST include ALL THREE sections in EVERY response:
-1. <think></think> - Your internal reasoning and analysis
-2. <conclusion></conclusion> - Your final answer
-3. <files></files> - Relevant file references (can be empty if no files are relevant)
+REQUIRED OUTPUT FORMAT:
+- Include ONLY the following two XML sections in your final output, and nothing else:
+  1) <conclusion>...</conclusion>  -- your final answer (brief, direct)
+  2) <files>...</files>           -- newline or comma-separated relevant file references (empty if none)
 
-CRITICAL RULES:
-- ALL THREE TAGS ARE MANDATORY in every response
-- Even if a section is empty, you MUST include the tags
-- Never skip any of the three sections
-- The tags must appear in the order: think, conclusion, files
+FORMAT RULES:
+- Do NOT include any <think> or internal reasoning tags.
+- If no files are relevant, include an empty <files></files> section.
+- Keep the content in <conclusion> short and focused; avoid step-by-step reasoning.
 
-EXAMPLE WITH CONTENT:
-<think>
-Let me analyze this question about beach photos. I need to search through the available files and identify ones with beach-related tags.
-</think>
-
+EXAMPLE WITH FILES:
 <conclusion>
-You have 12 beach photos in your collection from your summer vacation, including sunset scenes and family gatherings.
+The image shows a man in a museum exhibit interacting with flutes while listening to an audio guide.
 </conclusion>
 
 <files>
-- vacation/beach_sunset.jpg
-- summer/family_beach.jpg
+- exhibits/flutes_gallery.jpg
 </files>
 
-EXAMPLE WITH NO FILES:
-<think>
-This is a general question that doesn't require specific file references. I'll provide a direct answer.
-</think>
-
+EXAMPLE WITHOUT FILES:
 <conclusion>
-Here is the answer to your question...
+The scene depicts a quiet museum visitor examining musical instruments while listening to an audio guide.
 </conclusion>
 
 <files>
 </files>
 
-Remember: ALL three sections (<think>, <conclusion>, <files>) are MANDATORY in EVERY response, even if empty.""",
+Remember: Only <conclusion> and <files> are allowed in the final model output; do not output reasoning or any extra tags.""",
         description="System prompt for chat conversations"
     )
     tag_prompt: str = Field(
@@ -375,10 +400,10 @@ Remember: Both sections are required.""",
         
         # Auto-detect based on model name
         model_lower = model_name.lower()
-        if "qwen2.5-vl" in model_lower or "ggml" in model_lower:
-            return "llama-mtmd-cli"
-        else:
-            return "llama-cli"
+        # if "qwen2.5-vl" in model_lower or "ggml" in model_lower:
+        return "llama-mtmd-cli"
+        # else:
+        #     return "llama-cli"
 
 
 # Global configuration instance

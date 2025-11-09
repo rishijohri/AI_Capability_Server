@@ -23,6 +23,7 @@ class ConfigResponse(BaseModel):
     vision_binary: Optional[str] = None
     backend: Optional[str] = None
     model_timeout: Optional[int] = None
+    llm_timeout: int
     llm_params: Dict[str, Any]
     rag_directory_name: str
     storage_metadata_path: Optional[str]
