@@ -89,6 +89,20 @@ Complete documentation for the AI Server project.
 
 ---
 
+### [PYINSTALLER_SPEC_GUIDE.md](PYINSTALLER_SPEC_GUIDE.md)
+**PyInstaller spec file reference** covering:
+- Why two separate spec files are needed
+- Detailed comparison of Unix vs Windows spec files
+- Binary collection differences
+- Common features and customization options
+- Platform-specific build instructions
+- Distribution and troubleshooting
+- Best practices
+
+**Best for** understanding PyInstaller builds and customizing the packaging process.
+
+---
+
 ### [LLM_BACKEND_IMPLEMENTATION.md](LLM_BACKEND_IMPLEMENTATION.md)
 **Technical backend documentation** covering:
 - Backend architecture (server vs CLI mode)
@@ -141,6 +155,12 @@ Complete documentation for the AI Server project.
 
 **...deploy on Windows**
 → [WINDOWS_SUPPORT.md](WINDOWS_SUPPORT.md)
+
+**...understand PyInstaller builds**
+→ [PYINSTALLER_SPEC_GUIDE.md](PYINSTALLER_SPEC_GUIDE.md)
+
+**...customize the build process**
+→ [PYINSTALLER_SPEC_GUIDE.md](PYINSTALLER_SPEC_GUIDE.md)
 
 **...troubleshoot an issue**
 → [README_AI_SERVER.md](README_AI_SERVER.md#troubleshooting) or [QUICKSTART.md](QUICKSTART.md#common-issues)

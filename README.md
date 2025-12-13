@@ -80,7 +80,8 @@ AI_Capability/
 ├── build.ps1                # Build script (Windows PowerShell)
 ├── build.bat                # Build script (Windows Batch)
 ├── example_client.py        # Example client
-└── ai_capability.spec       # PyInstaller spec
+├── ai_capability.spec       # PyInstaller spec (macOS/Linux)
+└── ai_capability_windows.spec  # PyInstaller spec (Windows)
 ```
 
 ## 🚀 Building Executable
@@ -90,7 +91,7 @@ AI_Capability/
 # Using build script (recommended)
 ./build.sh
 
-# Or manually
+# Or manually with Unix spec file
 pyinstaller ai_capability.spec
 ```
 
@@ -102,8 +103,8 @@ pyinstaller ai_capability.spec
 # Or using batch script
 build.bat
 
-# Or manually
-pyinstaller ai_capability.spec
+# Or manually with Windows spec file
+pyinstaller ai_capability_windows.spec
 ```
 
 ### Running the Executable

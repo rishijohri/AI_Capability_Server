@@ -92,12 +92,12 @@ if (Test-Path "dist") {
     Remove-Item -Path "dist" -Recurse -Force
 }
 
-# Build with PyInstaller
-Write-Host "Running PyInstaller..." -ForegroundColor Cyan
+# Build with PyInstaller using Windows spec file
+Write-Host "Running PyInstaller with Windows spec file..." -ForegroundColor Cyan
 Write-Host ""
 
 try {
-    & pyinstaller --clean ai_capability.spec
+    & pyinstaller --clean ai_capability_windows.spec
     $buildSuccess = $LASTEXITCODE -eq 0
 } catch {
     $buildSuccess = $false

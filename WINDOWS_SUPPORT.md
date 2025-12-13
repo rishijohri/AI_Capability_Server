@@ -187,31 +187,45 @@ The Unix build script will:
 
 ### Spec File Configuration
 
-The `ai_capability.spec` file automatically handles binary collection:
+The project includes **two PyInstaller spec files** for cross-platform compatibility:
 
+| Spec File | Platform | Binaries | Usage |
+|-----------|----------|----------|-------|
+| `ai_capability.spec` | macOS/Linux | No extension | Used by `build.sh` |
+| `ai_capability_windows.spec` | Windows | `.exe` extension | Used by `build.ps1` and `build.bat` |
+
+**macOS/Linux spec file** (`ai_capability.spec`):
 ```python
-# In ai_capability.spec
-a = Analysis(
-    # ...
-    datas=[
-        ('binary/*', 'binary'),  # Includes all files in binary/
-        ('model/', 'model'),
-        # ...
-    ]
-)
+# Collects binaries without extensions
+for binary_file in binary_dir.iterdir():
+    if binary_file.is_file():
+        binaries.append((str(binary_file), 'binary'))
 ```
 
-**Note**: The wildcard `binary/*` will include:
-- `llama-*.exe` files on Windows
-- `llama-*` files (no extension) on macOS/Linux
+**Windows spec file** (`ai_capability_windows.spec`):
+```python
+# Collects .exe and .dll files
+for binary_file in binary_dir.iterdir():
+    if binary_file.is_file():
+        if binary_file.suffix.lower() in ['.exe', '.dll']:
+            binaries.append((str(binary_file), 'binary'))
+```
+
+Both spec files automatically handle:
+- ✅ Binary collection (platform-specific)
+- ✅ Model files (.gguf)
+- ✅ InsightFace models (recursive subdirectories)
+- ✅ All Python dependencies
+- ✅ Hidden imports
+- ✅ Folder-based distribution
 
 ### Build Scripts Available
 
-| Platform | Script | Description |
-|----------|--------|-------------|
-| **Windows** | `build.ps1` | PowerShell script (recommended) |
-| **Windows** | `build.bat` | Batch script (alternative) |
-| **macOS/Linux** | `build.sh` | Bash script |
+| Platform | Script | Command | Spec File Used |
+|----------|--------|---------|----------------|
+| **Windows** | `build.ps1` | `.\build.ps1` | `ai_capability_windows.spec` |
+| **Windows** | `build.bat` | `build.bat` | `ai_capability_windows.spec` |
+| **macOS/Linux** | `build.sh` | `./build.sh` | `ai_capability.spec` |
 
 All scripts provide:
 - ✅ Virtual environment activation

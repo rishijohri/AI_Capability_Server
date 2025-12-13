@@ -79,7 +79,7 @@ echo ""
 echo "Cleaning previous builds..."
 rm -rf build/ dist/
 
-# Build with PyInstaller
+# Build with PyInstaller using Unix/macOS spec file
 echo "Running PyInstaller..."
 pyinstaller --clean ai_capability.spec
 

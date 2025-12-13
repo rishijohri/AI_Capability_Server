@@ -36,14 +36,27 @@ The AI Capability Server has been updated to work seamlessly on **both Windows a
 - Alternative Windows build script using batch
 - Compatible with Command Prompt
 - Same functionality as PowerShell script
+- Uses `ai_capability_windows.spec`
 
-### 7. **README.md**
+### 7. **ai_capability_windows.spec** (NEW - Windows Spec File)
+- Windows-specific PyInstaller spec file
+- Handles `.exe` and `.dll` binary collection
+- Optimized for Windows executable generation
+- Used automatically by Windows build scripts
+
+### 8. **ai_capability.spec** (UPDATED - Unix Spec File)
+- Enhanced with comments clarifying it's for macOS/Linux
+- Handles binaries without extensions
+- Used automatically by Unix build script
+
+### 9. **README.md**
 - Added platform-specific quick start sections
 - Separate instructions for Windows vs macOS/Linux
 - Reference to WINDOWS_SUPPORT.md
 - Updated build instructions with all three scripts
+- Mentions both spec files
 
-### 8. **DOCUMENTATION_INDEX.md**
+### 10. **DOCUMENTATION_INDEX.md**
 - Added WINDOWS_SUPPORT.md to documentation index
 - Added "deploy on Windows" to use case guide
 
@@ -136,11 +149,19 @@ binary/
 
 ## 🔨 Build Scripts Available
 
-| Platform | Script | Command | Description |
-|----------|--------|---------|-------------|
-| Windows | `build.ps1` | `.\build.ps1` | PowerShell (recommended) |
-| Windows | `build.bat` | `build.bat` | Command Prompt |
-| macOS/Linux | `build.sh` | `./build.sh` | Bash script |
+| Platform | Script | Command | Spec File |
+|----------|--------|---------|-----------|
+| Windows | `build.ps1` | `.\build.ps1` | `ai_capability_windows.spec` |
+| Windows | `build.bat` | `build.bat` | `ai_capability_windows.spec` |
+| macOS/Linux | `build.sh` | `./build.sh` | `ai_capability.spec` |
+
+**Why Two Spec Files?**
+
+The project maintains separate PyInstaller spec files because:
+- Windows binaries have `.exe` extensions that need specific handling
+- Unix binaries have no extensions and require different collection logic
+- This ensures optimal binary detection and packaging on each platform
+- Both spec files produce identical functionality, just with platform-appropriate executables
 
 All scripts provide:
 - ✅ Virtual environment activation

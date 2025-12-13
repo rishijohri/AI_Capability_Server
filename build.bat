@@ -81,11 +81,11 @@ echo Cleaning previous builds...
 if exist "build" rmdir /s /q "build"
 if exist "dist" rmdir /s /q "dist"
 
-REM Build with PyInstaller
-echo Running PyInstaller...
+REM Build with PyInstaller using Windows spec file
+echo Running PyInstaller with Windows spec file...
 echo.
 
-pyinstaller --clean ai_capability.spec
+pyinstaller --clean ai_capability_windows.spec
 
 REM Check if build was successful
 if exist "dist\ai_capability_server\ai_capability_server.exe" (
