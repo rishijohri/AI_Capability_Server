@@ -19,7 +19,6 @@ from app.models import (
     StatusResponse,
     TagRequest,
     DescribeRequest,
-    RegenerateEmbeddingsRequest,
     ChatRequest,
     WebSocketMessage,
     MetadataStore,
@@ -158,6 +157,9 @@ async def load_rag():
     metadata_store = get_metadata_store()
     rag_service = get_rag_service()
     
+    # Check if metadata file has been updated and reload if necessary
+    await metadata_store.reload_if_modified()
+    
     if rag_service.load_rag(metadata_store):
         return StatusResponse(
             status="success",
@@ -170,108 +172,9 @@ async def load_rag():
         )
 
 
-@router.post("/regenerate-embeddings", response_model=StatusResponse)
-async def regenerate_embeddings(request: RegenerateEmbeddingsRequest):
-    """
-    Regenerate embeddings for specific files.
-    
-    This endpoint allows selective regeneration of embeddings when file metadata
-    (tags, descriptions, etc.) has been updated. It accepts a list of file metadata
-    objects and regenerates embeddings only for those files, updating the embeddings
-    database without reprocessing the entire collection.
-    
-    Args:
-        request: Request containing list of FileMetadata objects in 'data' parameter
-        
-    Returns:
-        StatusResponse with success message and count of regenerated embeddings
-        
-    Raises:
-        HTTPException: If embedding generation fails or model loading fails
-    """
-    try:
-        config = get_config()
-        embedding_service = get_embedding_service()
-        llm_service = get_llm_service()
-        
-        # Parse file metadata from request
-        file_metadata_list = [FileMetadata(**item) for item in request.data]
-        
-        if not file_metadata_list:
-            raise HTTPException(
-                status_code=400,
-                detail="No file metadata provided in 'data' parameter"
-            )
-        
-        # Load embedding model
-        await llm_service.load_model(
-            model_path=config.embedding_model,
-            mode="embedding"
-        )
-        
-        # Load existing embeddings
-        embeddings = embedding_service.load_embeddings()
-        
-        # Generate new embeddings for each file
-        regenerated_count = 0
-        for metadata in file_metadata_list:
-            # Generate text representation
-            text = metadata.to_text_representation()
-            
-            # Get embedding from model
-            embedding = await llm_service.get_embedding(text)
-            
-            # Update in embeddings dictionary
-            embeddings[metadata.fileName] = embedding
-            regenerated_count += 1
-        
-        # Apply PCA reduction if configured (this will also save and update service)
-        if config.reduced_embedding_size:
-            embeddings = embedding_service.reduce_embeddings(
-                embeddings,
-                config.reduced_embedding_size
-            )
-        else:
-            # No PCA reduction - save embeddings and update service manually
-            rag_directory = Path(get_metadata_store().metadata_path).parent / "rag"
-            embeddings_path = rag_directory / "embeddings.json"
-            
-            with open(embeddings_path, 'w', encoding='utf-8') as f:
-                json.dump(embeddings, f, indent=2)
-            
-            # Update embeddings in service
-            embedding_service.embeddings = embeddings
-        
-        # Unload model
-        await llm_service.unload_model()
-        
-        return StatusResponse(
-            status="success",
-            message=f"Successfully regenerated embeddings for {regenerated_count} file(s)",
-            data={
-                "regenerated_count": regenerated_count,
-                "file_names": [m.fileName for m in file_metadata_list]
-            }
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        # Ensure model is unloaded on error
-        try:
-            await get_llm_service().unload_model()
-        except:
-            pass
-        
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to regenerate embeddings: {type(e).__name__}: {str(e)}"
-        )
-
-
-@router.websocket("/generate-embeddings")
-async def generate_embeddings_ws(websocket: WebSocket):
-    """Generate embeddings for all files (WebSocket)."""
+@router.websocket("/vector-embeddings")
+async def vector_embeddings_ws(websocket: WebSocket):
+    """Generate or regenerate embeddings for files (WebSocket)."""
     await websocket.accept()
     
     # Track tasks for cancellation
@@ -283,11 +186,92 @@ async def generate_embeddings_ws(websocket: WebSocket):
         data = await websocket.receive_json()
         config = get_config()
         embedding_model = data.get("embedding_model") or config.embedding_model
-        force_regen = data.get("force_regen", False)  # Default to False
+        file_names = data.get("file_names")  # Optional list of specific files
+        regenerate_all = data.get("regenerate_all", False)  # Regenerate all files
         
         metadata_store = get_metadata_store()
         embedding_service = get_embedding_service()
         llm_service = get_llm_service()
+        
+        # Track failed files
+        failed_files = []
+        
+        # Check if metadata file has been updated and reload if necessary
+        if await metadata_store.reload_if_modified():
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message="Storage metadata file was updated. Reloaded metadata."
+                ).to_json()
+            )
+        
+        # Determine which files to process
+        if file_names:
+            # Process specific files
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message=f"Processing {len(file_names)} specific file(s)..."
+                ).to_json()
+            )
+            files_to_process = []
+            for file_name in file_names:
+                metadata = metadata_store.get_metadata_by_filename(file_name)
+                if not metadata:
+                    # Report error for this file but continue with others
+                    await websocket.send_json(
+                        WebSocketMessage(
+                            type="error",
+                            message=f"File not found in metadata: {file_name}",
+                            data={"filename": file_name, "error": "File not found in metadata", "continue": True}
+                        ).to_json()
+                    )
+                    # Track as failed
+                    failed_files.append({"filename": file_name, "error": "File not found in metadata"})
+                    continue
+                files_to_process.append(metadata)
+        elif regenerate_all:
+            # Process all files
+            files_to_process = metadata_store.get_all_metadata()
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message=f"Regenerating embeddings for all {len(files_to_process)} file(s)..."
+                ).to_json()
+            )
+        else:
+            # Default: process only files without embeddings
+            all_files = metadata_store.get_all_metadata()
+            # Load embeddings if they exist, otherwise start with empty dict
+            embedding_service.load_embeddings()
+            existing_embeddings = embedding_service.get_all_embeddings()
+            # Ensure existing_embeddings is a dict (it should be, but safeguard)
+            if not isinstance(existing_embeddings, dict):
+                existing_embeddings = {}
+            files_to_process = [f for f in all_files if f.fileName not in existing_embeddings]
+            
+            if not files_to_process:
+                await websocket.send_json(
+                    WebSocketMessage(
+                        type="status",
+                        message="All files already have embeddings"
+                    ).to_json()
+                )
+                await websocket.send_json(
+                    WebSocketMessage(
+                        type="result",
+                        message="Embeddings generated successfully",
+                        data={"count": len(existing_embeddings), "processed": 0}
+                    ).to_json()
+                )
+                return
+            
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message=f"Found {len(existing_embeddings)} existing embeddings, processing {len(files_to_process)} new file(s)..."
+                ).to_json()
+            )
         
         # Progress callback
         async def progress_callback(current: int, total: int, filename: str):
@@ -301,7 +285,7 @@ async def generate_embeddings_ws(websocket: WebSocket):
                     ).to_json()
                 )
             elif current == 0 and total == 0:
-                # Status messages like "Found X existing embeddings..."
+                # Status messages
                 await websocket.send_json(
                     WebSocketMessage(
                         type="status",
@@ -317,7 +301,18 @@ async def generate_embeddings_ws(websocket: WebSocket):
                     ).to_json()
                 )
         
-        # Generate embeddings
+        # Error callback for individual file failures
+        async def error_callback(filename: str, error_message: str):
+            failed_files.append({"filename": filename, "error": error_message})
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="error",
+                    message=f"Failed to generate embedding for {filename}: {error_message}",
+                    data={"filename": filename, "error": error_message, "continue": True}
+                ).to_json()
+            )
+        
+        # Generate embeddings for selected files
         await websocket.send_json(
             WebSocketMessage(
                 type="status",
@@ -327,28 +322,55 @@ async def generate_embeddings_ws(websocket: WebSocket):
         
         # Wrap in task for cancellation support
         async def generate_embeddings_task():
-            return await embedding_service.generate_embeddings(
-                metadata_store,
+            return await embedding_service.generate_embeddings_for_files(
+                files_to_process,
                 embedding_model,
                 progress_callback,
-                force_regen
+                error_callback
             )
         
         generation_task = asyncio.create_task(generate_embeddings_task())
-        try:
-            # Use a longer timeout for embeddings since they process multiple files
-            embeddings = await asyncio.wait_for(generation_task, timeout=config.llm_timeout * 10)
-        except asyncio.TimeoutError:
-            generation_task.cancel()
-            raise RuntimeError(f"Embedding generation timed out after {config.llm_timeout * 10} seconds")
         
-        await websocket.send_json(
-            WebSocketMessage(
-                type="result",
-                message="Embeddings generated successfully",
-                data={"count": len(embeddings), "force_regen": force_regen}
-            ).to_json()
-        )
+        # Execute the task - no global timeout, let individual files handle their own timeouts
+        try:
+            embeddings = await generation_task
+        except Exception as e:
+            # Any exception from embedding generation should be logged but not stop the process
+            # since individual file errors are already handled via error_callback
+            if error_callback:
+                await error_callback("batch_process", f"Unexpected error during batch processing: {str(e)}")
+            # Use empty embeddings dict if generation failed completely
+            embeddings = {}
+        
+        # Send final result with success/failure summary
+        success_count = len(files_to_process) - len(failed_files)
+        if failed_files:
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="result",
+                    message=f"Embeddings generated with {len(failed_files)} failure(s)",
+                    data={
+                        "count": len(embeddings),
+                        "processed": len(files_to_process),
+                        "successful": success_count,
+                        "failed": len(failed_files),
+                        "failed_files": failed_files
+                    }
+                ).to_json()
+            )
+        else:
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="result",
+                    message="Embeddings generated successfully",
+                    data={
+                        "count": len(embeddings),
+                        "processed": len(files_to_process),
+                        "successful": success_count,
+                        "failed": 0
+                    }
+                ).to_json()
+            )
         
     except WebSocketDisconnect:
         # Client disconnected - cancel any running generation
@@ -368,47 +390,13 @@ async def generate_embeddings_ws(websocket: WebSocket):
         if llm_service and config.llm_mode == "cli":
             if hasattr(llm_service.current_backend, 'cancel_generation'):
                 await llm_service.current_backend.cancel_generation()
-    except asyncio.TimeoutError:
-        # Task timed out
-        if generation_task and not generation_task.done():
-            generation_task.cancel()
-        
-        if llm_service and config.llm_mode == "cli":
-            if hasattr(llm_service.current_backend, 'cancel_generation'):
-                await llm_service.current_backend.cancel_generation()
-        
-        await websocket.send_json(
-            WebSocketMessage(
-                type="error",
-                message=f"Embedding generation timed out after {config.llm_timeout * 10} seconds",
-                data={"timeout": config.llm_timeout * 10}
-            ).to_json()
-        )
     except Exception as e:
-        # Cancel task if running
-        if generation_task and not generation_task.done():
-            generation_task.cancel()
-            try:
-                await generation_task
-            except asyncio.CancelledError:
-                pass
-        
-        error_details = {
-            "error_type": type(e).__name__,
-            "error_message": str(e),
-            "traceback": traceback.format_exc(),
-            "embedding_model": data.get("embedding_model") if 'data' in locals() else None,
-            "force_regen": data.get("force_regen", False) if 'data' in locals() else False
-        }
-        await websocket.send_json(
-            WebSocketMessage(
-                type="error",
-                message=f"Embedding generation failed: {type(e).__name__}: {str(e)}",
-                data=error_details
-            ).to_json()
-        )
+        # Log unexpected errors but don't close the socket
+        # Individual file errors are already handled via error_callback
+        print(f"Unexpected error in vector-embeddings WebSocket: {type(e).__name__}: {str(e)}")
+        print(traceback.format_exc())
     finally:
-        # Final cleanup
+        # Final cleanup - only cancel task if still running
         if generation_task and not generation_task.done():
             generation_task.cancel()
         await websocket.close()
@@ -422,6 +410,15 @@ async def generate_rag_ws(websocket: WebSocket):
     try:
         metadata_store = get_metadata_store()
         rag_service = get_rag_service()
+        
+        # Check if metadata file has been updated and reload if necessary
+        if await metadata_store.reload_if_modified():
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message="Storage metadata file was updated. Reloaded metadata."
+                ).to_json()
+            )
         
         # Progress callback
         async def progress_callback(message: str):
@@ -491,6 +488,15 @@ async def tag_files_ws(websocket: WebSocket):
         metadata_store = get_metadata_store()
         vision_service = get_vision_service()
         llm_service = get_llm_service()
+        
+        # Check if metadata file has been updated and reload if necessary
+        if await metadata_store.reload_if_modified():
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message="Storage metadata file was updated. Reloaded metadata."
+                ).to_json()
+            )
         
         try:
             for idx, file_path_str in enumerate(file_paths):
@@ -746,6 +752,15 @@ async def describe_files_ws(websocket: WebSocket):
         vision_service = get_vision_service()
         llm_service = get_llm_service()
         
+        # Check if metadata file has been updated and reload if necessary
+        if await metadata_store.reload_if_modified():
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message="Storage metadata file was updated. Reloaded metadata."
+                ).to_json()
+            )
+        
         try:
             for idx, file_path_str in enumerate(file_paths):
                 # Get metadata
@@ -986,6 +1001,15 @@ async def chat_ws(websocket: WebSocket):
         
         metadata_store = get_metadata_store()
         rag_service = get_rag_service()
+        
+        # Check if metadata file has been updated and reload if necessary
+        if await metadata_store.reload_if_modified():
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message="Storage metadata file was updated. Reloaded metadata."
+                ).to_json()
+            )
         
         # Ensure RAG is loaded
         if not rag_service.is_loaded():
@@ -1531,6 +1555,9 @@ async def detect_faces(request: dict):
         metadata_store = get_metadata_store()
         face_service = get_face_service()
         
+        # Check if metadata file has been updated and reload if necessary
+        await metadata_store.reload_if_modified()
+        
         results = {}
         
         for file_path_str in file_paths:
@@ -1596,6 +1623,9 @@ async def get_face_crop(request: dict):
         
         metadata_store = get_metadata_store()
         face_service = get_face_service()
+        
+        # Check if metadata file has been updated and reload if necessary
+        await metadata_store.reload_if_modified()
         
         # Get metadata
         metadata = metadata_store.get_metadata_by_filename(image_name)

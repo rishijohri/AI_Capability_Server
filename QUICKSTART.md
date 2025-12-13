@@ -63,6 +63,16 @@ curl -X POST http://127.0.0.1:8000/api/set-storage-metadata \
 
 This tells the server where your file metadata JSON is located. All file paths will be resolved relative to this location.
 
+**Important:** Your directory structure should be:
+```
+/path/to/your/data/
+├── storage_metadata.json    # Metadata file
+└── files/                   # All media files go here
+    ├── image1.jpg
+    ├── video1.mp4
+    └── ...
+```
+
 ### 2. Check Configuration
 
 ```bash

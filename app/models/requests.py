@@ -42,11 +42,6 @@ class DescribeRequest(BaseModel):
     file_paths: List[str] = Field(..., description="List of file paths to describe")
 
 
-class RegenerateEmbeddingsRequest(BaseModel):
-    """Request to regenerate embeddings for specific files."""
-    data: List[Dict[str, Any]] = Field(..., description="List of file metadata objects to regenerate embeddings for")
-
-
 class ChatMessage(BaseModel):
     """Chat message in OpenAI format."""
     role: Literal["system", "user", "assistant", "tool"]

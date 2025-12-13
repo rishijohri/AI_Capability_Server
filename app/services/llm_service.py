@@ -64,7 +64,7 @@ class LlamaServerBackend(LLMBackend):
     def __init__(self):
         """Initialize llama-server backend."""
         self.process_manager = get_process_manager()
-        self.base_url = "http://localhost:8080"
+        self.base_url = "http://localhost:8100"
         self.process_name = "llama-server"
         self._model_loaded = False
         self.startup_command: Optional[List[str]] = None
@@ -88,7 +88,7 @@ class LlamaServerBackend(LLMBackend):
             "--batch-size", str(config.llm_params.batch_size),
             "--ubatch-size", str(config.llm_params.ubatch_size),
             "--n-gpu-layers", str(config.llm_params.n_gpu_layers),
-            "--port", "8080",
+            "--port", "8100",
             "--host", "127.0.0.1",
             "--embeddings"  # Enable embeddings support
         ]

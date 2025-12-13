@@ -44,6 +44,15 @@ curl -X POST http://localhost:8000/api/set-storage-metadata \
   -d '{"path": "/path/to/your/metadata.json"}'
 ```
 
+**Note:** Ensure your directory structure is:
+```
+/path/to/your/data/
+├── metadata.json    # Storage metadata file
+└── files/           # All photos and videos
+    ├── image1.jpg
+    └── video1.mp4
+```
+
 ## 4. Generate Embeddings (WebSocket)
 
 ```python

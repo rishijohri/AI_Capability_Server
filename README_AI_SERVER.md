@@ -569,6 +569,22 @@ The server expects metadata in the following JSON format:
 ]
 ```
 
+### File Storage Structure
+
+**All photos and videos must be located in a `files` subdirectory** at the same level as the `storage_metadata.json` file:
+
+```
+/path/to/your/data/
+├── storage_metadata.json    # Metadata file
+└── files/                   # All media files go here
+    ├── example.jpg
+    ├── video1.mp4
+    ├── photo2.png
+    └── ...
+```
+
+The `fileName` field in the metadata should contain only the filename (e.g., `"example.jpg"`), and the server will automatically resolve the full path by looking in the `files/` subdirectory.
+
 ## Examples
 
 ### Python Client Example

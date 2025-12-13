@@ -1,10 +1,28 @@
-"""Metadata models for file storage."""
+"""Metadata models for file storage.
+
+File Storage Structure:
+    All photos and videos must be stored in a 'files' subdirectory at the same level
+    as the storage_metadata.json file:
+    
+    /path/to/your/data/
+    ├── storage_metadata.json    # Metadata file
+    ├── rag/                     # RAG database (auto-generated)
+    └── files/                   # All media files
+        ├── photo1.jpg
+        ├── video1.mp4
+        └── ...
+    
+    The fileName field in storage_metadata.json should contain only the filename
+    (e.g., "photo1.jpg"), not the full path. The MetadataStore.get_file_path()
+    method automatically prepends "files/" to resolve the full path.
+"""
 
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
 from datetime import datetime
 import json
 from pathlib import Path
+import asyncio
 
 
 class FileMetadata(BaseModel):
@@ -48,12 +66,17 @@ class MetadataStore:
         """Initialize metadata store."""
         self.metadata_path = Path(metadata_path)
         self.metadata: List[FileMetadata] = []
+        self._last_modified_time: Optional[float] = None
+        self._reload_lock = asyncio.Lock()
         self._load_metadata()
     
     def _load_metadata(self) -> None:
         """Load metadata from file."""
         if not self.metadata_path.exists():
             raise FileNotFoundError(f"Metadata file not found: {self.metadata_path}")
+        
+        # Track file modification time
+        self._last_modified_time = self.metadata_path.stat().st_mtime
         
         with open(self.metadata_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -82,8 +105,31 @@ class MetadataStore:
         return False
     
     def get_file_path(self, filename: str) -> Path:
-        """Get full path to a file relative to metadata location."""
-        return self.metadata_path.parent / filename
+        """Get full path to a file relative to metadata location.
+        
+        Files are expected to be in a 'files' subdirectory at the same level
+        as the storage_metadata.json file.
+        """
+        return self.metadata_path.parent / "files" / filename
+    
+    def has_been_modified(self) -> bool:
+        """Check if the metadata file has been modified since last load."""
+        if not self.metadata_path.exists():
+            return False
+        
+        current_mtime = self.metadata_path.stat().st_mtime
+        return current_mtime > self._last_modified_time if self._last_modified_time else True
+    
+    async def reload_if_modified(self) -> bool:
+        """Reload metadata if file has been modified. Returns True if reloaded.
+        
+        Thread-safe: Uses asyncio lock to prevent concurrent reloads.
+        """
+        async with self._reload_lock:
+            if self.has_been_modified():
+                self._load_metadata()
+                return True
+            return False
     
     def reload(self) -> None:
         """Reload metadata from file."""

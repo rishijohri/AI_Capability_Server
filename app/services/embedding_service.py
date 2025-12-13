@@ -200,6 +200,120 @@ class EmbeddingService:
     def get_all_embeddings(self) -> Dict[str, List[float]]:
         """Get all embeddings."""
         return self.embeddings
+    
+    async def generate_embeddings_for_files(
+        self,
+        files_to_process: List[FileMetadata],
+        embedding_model: str,
+        progress_callback=None,
+        error_callback=None
+    ) -> Dict[str, List[float]]:
+        """
+        Generate embeddings for a specific list of files.
+        
+        Args:
+            files_to_process: List of file metadata to generate embeddings for
+            embedding_model: Name of embedding model to use
+            progress_callback: Optional callback for progress updates
+            error_callback: Optional callback for error notifications
+            
+        Returns:
+            Dictionary mapping filenames to embedding vectors
+        """
+        llm_service = get_llm_service()
+        
+        if not files_to_process:
+            return self.embeddings
+        
+        # Load embedding model
+        await llm_service.load_model(embedding_model)
+        
+        # Get and report startup command
+        startup_cmd = llm_service.get_startup_command()
+        if progress_callback and startup_cmd:
+            await progress_callback(0, 0, f"LLM Command: {startup_cmd}")
+        
+        # Load existing embeddings
+        embeddings = self.embeddings.copy()
+        total = len(files_to_process)
+        
+        for idx, metadata in enumerate(files_to_process):
+            max_retries = 2  # Retry once if server disconnects
+            retry_count = 0
+            success = False
+            
+            while retry_count <= max_retries and not success:
+                try:
+                    # Generate text representation
+                    text = metadata.to_text_representation()
+                    
+                    # Generate embedding
+                    embedding = await llm_service.embed(text)
+                    embeddings[metadata.fileName] = embedding
+                    success = True
+                    
+                    # Progress callback
+                    if progress_callback:
+                        await progress_callback(idx + 1, total, metadata.fileName)
+                except Exception as e:
+                    error_msg = str(e)
+                    retry_count += 1
+                    
+                    # Check if it's a server disconnection/connection error
+                    is_connection_error = any(keyword in error_msg.lower() for keyword in [
+                        'server disconnected', 'connection', 'not running', 
+                        'timeout', 'cannot connect', 'connection refused'
+                    ])
+                    
+                    if is_connection_error and retry_count <= max_retries:
+                        # Try to restart the model and retry
+                        if progress_callback:
+                            await progress_callback(0, 0, f"Server disconnected, restarting model (attempt {retry_count}/{max_retries})...")
+                        
+                        try:
+                            # Unload and reload the model
+                            await llm_service.unload_model()
+                            await llm_service.load_model(embedding_model)
+                            
+                            # Report successful restart
+                            if progress_callback:
+                                await progress_callback(0, 0, "Model restarted successfully, retrying...")
+                        except Exception as restart_error:
+                            # If restart fails, notify and move to next file
+                            if error_callback:
+                                await error_callback(metadata.fileName, f"Failed to restart model: {str(restart_error)}")
+                            break
+                    else:
+                        # Non-connection error or max retries reached
+                        if error_callback:
+                            if retry_count > max_retries:
+                                await error_callback(metadata.fileName, f"Max retries exceeded: {error_msg}")
+                            else:
+                                await error_callback(metadata.fileName, error_msg)
+                        break
+        
+        # Unload model after generation
+        await llm_service.unload_model()
+        
+        # Store embeddings
+        self.embeddings = embeddings
+        if embeddings:
+            self.original_dim = len(next(iter(embeddings.values())))
+        
+        # Apply PCA reduction if configured
+        config = get_config()
+        if config.reduced_embedding_size and embeddings:
+            embeddings = self.reduce_embeddings(embeddings, config.reduced_embedding_size)
+        else:
+            # Save to file without PCA
+            rag_dir = config.get_rag_directory()
+            if rag_dir:
+                rag_dir.mkdir(exist_ok=True)
+                embeddings_file = rag_dir / "embeddings.json"
+                with open(embeddings_file, 'w') as f:
+                    json.dump(embeddings, f, indent=2)
+        
+        return embeddings
 
 
 # Global embedding service instance

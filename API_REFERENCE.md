@@ -31,6 +31,22 @@ For `/api/tag` and `/api/describe` endpoints, the `file_paths` array should cont
 
 **Example**: `["image1.jpg", "image2.png"]` not `["/full/path/to/image1.jpg"]`
 
+### File Storage Structure
+
+**All photos and videos must be located in a `files` subdirectory** at the same level as the `storage_metadata.json` file:
+
+```
+/path/to/your/data/
+├── storage_metadata.json    # Metadata file
+└── files/                   # All media files go here
+    ├── image1.jpg
+    ├── video1.mp4
+    ├── image2.png
+    └── ...
+```
+
+The `fileName` field in `storage_metadata.json` should contain only the filename (e.g., `"image1.jpg"`), and the server will automatically look for it in the `files/` subdirectory.
+
 ## Endpoints Overview
 
 | Endpoint | Type | Description |
@@ -39,12 +55,11 @@ For `/api/tag` and `/api/describe` endpoints, the `file_paths` array should cont
 | `/api/config` | POST | Update configuration |
 | `/api/set-storage-metadata` | POST | Set metadata file path |
 | `/api/load-rag` | POST | Load RAG database |
-| `/api/regenerate-embeddings` | POST | Regenerate embeddings for specific files |
 | `/api/kill` | POST | Shutdown server and all processes |
 | `/api/detect-faces` | POST | Detect and identify faces in images |
 | `/api/get-face-crop` | POST | Extract face crop by face ID |
 | `/api/rename-face-id` | POST | Rename a face ID in the database |
-| `/api/generate-embeddings` | WebSocket | Generate embeddings for files |
+| `/api/vector-embeddings` | WebSocket | Generate or regenerate embeddings for files |
 | `/api/generate-rag` | WebSocket | Build RAG database |
 | `/api/tag` | WebSocket | Generate tags for media |
 | `/api/describe` | WebSocket | Generate descriptions for media |
@@ -119,6 +134,7 @@ curl http://localhost:8000/api/config
 | `vision_binary` | string/null | ✅ | Override vision binary (null = auto-detect) |
 | `backend` | string | ✅ | Same as `llm_mode` |
 | `model_timeout` | int | ✅ | Seconds before unloading inactive model |
+| `llm_timeout` | int | ✅ | Timeout for LLM operations in seconds (10-3600) |
 | `llm_params` | object | ✅ | LLM execution parameters |
 | `rag_directory_name` | string | ❌ | RAG directory name (read-only) |
 | `storage_metadata_path` | string/null | ❌ | Current metadata path (read-only) |
@@ -188,10 +204,12 @@ curl -X POST http://localhost:8000/api/set-storage-metadata \
 ```json
 {
   "status": "success",
-  "message": "Storage metadata set",
+  "message": "Storage metadata set to /Users/username/data/storage-metadata.json",
   "data": {
     "metadata_count": 156,
-    "rag_directory": "/Users/username/data/rag"
+    "rag_directory": "/Users/username/data/rag",
+    "embeddings_loaded": true,
+    "embeddings_count": 156
   }
 }
 ```
@@ -239,136 +257,7 @@ curl -X POST http://localhost:8000/api/load-rag
 ```
 
 ---
-
-### POST /api/regenerate-embeddings
-
-Regenerate embeddings for specific files when their metadata has been updated (e.g., tags or descriptions changed). This endpoint allows selective regeneration without reprocessing the entire collection.
-
-**Use Case:** When you update tags or descriptions for files, use this endpoint to regenerate embeddings only for those specific files, maintaining consistency between metadata and embeddings without the overhead of regenerating all embeddings.
-
-**Request Body:**
-```json
-{
-  "data": [
-    {
-      "fileName": "image1.jpg",
-      "deviceId": "device-123",
-      "deviceName": "iPhone 12",
-      "uploadTime": "2024-01-15T10:30:00Z",
-      "tags": ["beach", "sunset", "vacation"],
-      "aspectRatio": 1.5,
-      "type": "image",
-      "creationTime": "2024-01-15T10:00:00Z",
-      "description": "Beautiful sunset at the beach"
-    },
-    {
-      "fileName": "video2.mp4",
-      "deviceId": "device-123",
-      "deviceName": "iPhone 12",
-      "uploadTime": "2024-01-16T14:20:00Z",
-      "tags": ["hiking", "mountains", "nature"],
-      "aspectRatio": 1.78,
-      "type": "video",
-      "creationTime": "2024-01-16T14:00:00Z",
-      "description": "Mountain hiking trail with scenic views"
-    }
-  ]
-}
-```
-
-**Request:**
-```bash
-curl -X POST http://localhost:8000/api/regenerate-embeddings \
-  -H "Content-Type: application/json" \
-  -d '{
-    "data": [
-      {
-        "fileName": "image1.jpg",
-        "deviceId": "device-123",
-        "deviceName": "iPhone 12",
-        "uploadTime": "2024-01-15T10:30:00Z",
-        "tags": ["beach", "sunset"],
-        "aspectRatio": 1.5,
-        "type": "image",
-        "creationTime": "2024-01-15T10:00:00Z",
-        "description": "Sunset at beach"
-      }
-    ]
-  }'
-```
-
-**Python Example:**
-```python
-import requests
-
-# Updated file metadata
-updated_files = [
-    {
-        "fileName": "image1.jpg",
-        "deviceId": "device-123",
-        "deviceName": "iPhone 12",
-        "uploadTime": "2024-01-15T10:30:00Z",
-        "tags": ["beach", "sunset", "vacation"],  # Updated tags
-        "aspectRatio": 1.5,
-        "type": "image",
-        "creationTime": "2024-01-15T10:00:00Z",
-        "description": "Beautiful sunset at the beach"  # Updated description
-    }
-]
-
-response = requests.post(
-    "http://localhost:8000/api/regenerate-embeddings",
-    json={"data": updated_files}
-)
-print(response.json())
-```
-
-**Response:** `200 OK`
-```json
-{
-  "status": "success",
-  "message": "Successfully regenerated embeddings for 2 file(s)",
-  "data": {
-    "regenerated_count": 2,
-    "file_names": ["image1.jpg", "video2.mp4"]
-  }
-}
-```
-
-**Behavior:**
-1. Validates file metadata objects in request
-2. Loads the embedding model (uses `embedding_model` from config)
-3. Generates embeddings for each file using updated metadata
-4. Updates the embeddings.json file with new embeddings (preserves other files' embeddings)
-5. Applies PCA reduction if `reduced_embedding_size` is configured
-6. Unloads the embedding model
-7. Returns success with count and list of regenerated files
-
-**Error Response:** `400 Bad Request`
-```json
-{
-  "detail": "No file metadata provided in 'data' parameter"
-}
-```
-
-**Error Response:** `500 Internal Server Error`
-```json
-{
-  "detail": "Failed to regenerate embeddings: FileNotFoundError: Embeddings file not found"
-}
-```
-
-**Important Notes:**
-- The `data` parameter must be an array of complete FileMetadata objects
-- The `fileName` field is used as the key to update embeddings in the embeddings database
-- All files must exist in the original storage-metadata.json (this endpoint only updates embeddings, not metadata)
-- The embedding model is loaded temporarily and unloaded after generation
-- PCA reduction is automatically applied if configured
-- This is a REST endpoint (synchronous), unlike `/generate-embeddings` which is a WebSocket
-- Use this when you've updated a few files; use `/generate-embeddings` with `force_regen: true` for bulk updates
-
 ---
-
 ### POST /api/kill
 
 Shutdown the server and terminate all associated processes including llama-server, llama-cli, and the Python application.
@@ -423,7 +312,7 @@ curl -X POST http://localhost:8000/api/detect-faces \
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `file_paths` | array[string] | ✅ | - | Filenames to process (not full paths) |
-| `similarity_threshold` | float | ❌ | 0.5 | Minimum cosine similarity for face matching (0.0-1.0) |
+| `similarity_threshold` | float | ❌ | 0.5 | Minimum cosine similarity for face matching (0.0-1.0). Recommended: 0.4 (loose), 0.5 (balanced), 0.6 (strict) |
 
 **Response:** `200 OK`
 ```json
@@ -511,7 +400,7 @@ Extract a cropped image of a specific face by face ID from an image.
 curl -X POST http://localhost:8000/api/get-face-crop \
   -H "Content-Type: application/json" \
   -d '{
-    "file_path": "family_photo.jpg",
+    "image_name": "family_photo.jpg",
     "face_id": "face_001",
     "padding": 20,
     "min_similarity": 0.4
@@ -522,20 +411,18 @@ curl -X POST http://localhost:8000/api/get-face-crop \
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `file_path` | string | ✅ | - | Filename (not full path) |
+| `image_name` | string | ✅ | - | Filename (not full path) |
 | `face_id` | string | ✅ | - | Face ID to extract |
 | `padding` | int | ❌ | 20 | Pixels to add around face bbox |
+| `min_similarity` | float | ❌ | 0.4 | Minimum similarity threshold for matching the face |
 | `min_similarity` | float | ❌ | 0.4 | Minimum similarity threshold |
 
 **Response:** `200 OK`
 ```json
 {
-  "status": "success",
+  "face_crop_base64": "iVBORw0KGgoAAAANSUhEUgAA...",
   "face_id": "face_001",
-  "filename": "family_photo.jpg",
-  "image_base64": "iVBORw0KGgoAAAANSUhEUgAA...",
-  "bbox": [120, 85, 230, 195],
-  "similarity": 0.92
+  "image_name": "family_photo.jpg"
 }
 ```
 
@@ -543,9 +430,9 @@ curl -X POST http://localhost:8000/api/get-face-crop \
 
 | Field | Description |
 |-------|-------------|
-| `image_base64` | Base64-encoded PNG image of the face crop |
-| `bbox` | Original bounding box [x, y, x+w, y+h] |
-| `similarity` | Cosine similarity score for the matched face |
+| `face_crop_base64` | Base64-encoded JPEG image of the face crop with padding |
+| `face_id` | The face ID that was requested |
+| `image_name` | The image filename |
 
 **Error Responses:**
 
@@ -580,7 +467,7 @@ import io
 response = requests.post(
     "http://localhost:8000/api/get-face-crop",
     json={
-        "file_path": "family_photo.jpg",
+        "image_name": "family_photo.jpg",
         "face_id": "face_001",
         "padding": 30
     }
@@ -589,9 +476,9 @@ response = requests.post(
 if response.status_code == 200:
     data = response.json()
     # Decode base64 image
-    img_data = base64.b64decode(data['image_base64'])
+    img_data = base64.b64decode(data['face_crop_base64'])
     img = Image.open(io.BytesIO(img_data))
-    img.save(f"{data['face_id']}.png")
+    img.save(f"{data['face_id']}.jpg")
 ```
 
 ---
@@ -703,7 +590,7 @@ interface WebSocketMessage {
 - `result` - Final result or completion
 - `error` - Error messages
 - `confirmation_needed` - Requires user confirmation to continue
-- `thinking` - Model's analysis/reasoning process (tag, describe, chat)
+- `thinking` - Model's analysis/reasoning process (tag and describe only; sanitized in chat)
 - `conclusion` - Final answer (chat only)
 - `files` - Relevant files section (chat only)
 
@@ -726,19 +613,41 @@ ws.onmessage = (event) => {
 
 ---
 
-### WS /api/generate-embeddings
+### WS /api/vector-embeddings
 
-Generate vector embeddings for all files in the storage metadata. Uses the specified embedding model to create numerical representations of file content.
+Generate or regenerate vector embeddings for files in the storage metadata. This unified endpoint handles both initial embedding generation and selective regeneration. Uses the specified embedding model to create numerical representations of file content.
 
-**Incremental Updates:** By default, only generates embeddings for files that don't already have them. Use `force_regen: true` to regenerate all embeddings.
+**Automatic Metadata Reload:** Always reloads `storage-metadata.json` if it has been modified since last load, ensuring embeddings reflect the latest metadata.
 
-**Connection:** `ws://localhost:8000/api/generate-embeddings`
+**Three Modes of Operation:**
+1. **New files only** (default): Generate embeddings only for files without existing embeddings
+2. **Specific files**: Regenerate embeddings for a list of filenames
+3. **All files**: Regenerate embeddings for all files in storage metadata
+
+**Connection:** `ws://localhost:8000/api/vector-embeddings`
 
 **1. Client Connects and Sends Configuration:**
+
+**Generate for new files only (default):**
+```json
+{
+  "embedding_model": "qwen3-embedding-8b-q4_k_m.gguf"
+}
+```
+
+**Regenerate specific files:**
 ```json
 {
   "embedding_model": "qwen3-embedding-8b-q4_k_m.gguf",
-  "force_regen": false
+  "file_names": ["image1.jpg", "image2.jpg", "video1.mp4"]
+}
+```
+
+**Regenerate all files:**
+```json
+{
+  "embedding_model": "qwen3-embedding-8b-q4_k_m.gguf",
+  "regenerate_all": true
 }
 ```
 
@@ -747,13 +656,32 @@ Generate vector embeddings for all files in the storage metadata. Uses the speci
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `embedding_model` | string | ❌ | From config | Embedding model filename |
-| `force_regen` | boolean | ❌ | false | If true, regenerate all embeddings. If false, only generate for new files |
+| `file_names` | array[string] | ❌ | null | List of specific filenames to process. If provided, only these files are processed |
+| `regenerate_all` | boolean | ❌ | false | If true, regenerate embeddings for all files. If true, `file_names` is ignored |
 
 **2. Server Responds with Status:**
+
+**New files mode:**
 ```json
 {
   "type": "status",
-  "message": "Found 100 existing embeddings, processing 56 new files"
+  "message": "Found 100 existing embeddings, processing 56 new file(s)..."
+}
+```
+
+**Specific files mode:**
+```json
+{
+  "type": "status",
+  "message": "Processing 3 specific file(s)..."
+}
+```
+
+**Regenerate all mode:**
+```json
+{
+  "type": "status",
+  "message": "Regenerating embeddings for all 156 file(s)..."
 }
 ```
 
@@ -770,23 +698,87 @@ Generate vector embeddings for all files in the storage metadata. Uses the speci
 }
 ```
 
-**4. Server Sends Final Result:**
+**4. Server May Send Status Messages for Connection Issues:**
+
+If the LLM server disconnects during processing, the system automatically restarts it and retries:
+
+```json
+{
+  "type": "status",
+  "message": "Server disconnected, restarting model (attempt 1/2)..."
+}
+```
+
+```json
+{
+  "type": "status",
+  "message": "Model restarted successfully, retrying..."
+}
+```
+
+**5. Server May Send Error Messages for Individual File Failures:**
+
+If a file fails during processing (even after retries), the server sends an error message but continues processing remaining files:
+
+```json
+{
+  "type": "error",
+  "message": "Failed to generate embedding for corrupted.jpg: Invalid file format",
+  "data": {
+    "filename": "corrupted.jpg",
+    "error": "Invalid file format",
+    "continue": true
+  }
+}
+```
+
+**Note:** The system automatically handles server disconnections by restarting the model and retrying the failed file up to 2 times before reporting an error.
+
+**6. Server Sends Final Result:**
+
+**Success - all files processed:**
 ```json
 {
   "type": "result",
   "message": "Embeddings generated successfully",
   "data": {
     "count": 156,
-    "force_regen": false
+    "processed": 56,
+    "successful": 56,
+    "failed": 0
   }
 }
 ```
 
-**5. Connection Closes**
+**Partial success - some files failed:**
+```json
+{
+  "type": "result",
+  "message": "Embeddings generated with 2 failure(s)",
+  "data": {
+    "count": 154,
+    "processed": 56,
+    "successful": 54,
+    "failed": 2,
+    "failed_files": [
+      {
+        "filename": "corrupted.jpg",
+        "error": "Invalid file format"
+      },
+      {
+        "filename": "missing.mp4",
+        "error": "File not accessible"
+      }
+    ]
+  }
+}
+```
+
+**7. Connection Closes**
 
 **Special Cases:**
 
-All files already have embeddings (when `force_regen: false`):
+All files already have embeddings (new files mode):
 ```json
 {
   "type": "status",
@@ -799,18 +791,26 @@ All files already have embeddings (when `force_regen: false`):
   "message": "Embeddings generated successfully",
   "data": {
     "count": 156,
-    "force_regen": false
+    "processed": 0
   }
+}
+```
+
+Metadata file was updated:
+```json
+{
+  "type": "status",
+  "message": "Storage metadata file was updated. Reloaded metadata."
 }
 ```
 
 **Error Cases:**
 
-Missing model parameter:
+File not found in metadata:
 ```json
 {
   "type": "error",
-  "message": "embedding_model is required"
+  "message": "File not found in metadata: unknown.jpg"
 }
 ```
 
@@ -822,18 +822,19 @@ Model not found:
 }
 ```
 
-**Python Example:**
+**Python Examples:**
+
+**Generate for new files only:**
 ```python
 import asyncio
 import websockets
 import json
 
-async def generate_embeddings(force_regen=False):
-    async with websockets.connect('ws://localhost:8000/api/generate-embeddings') as ws:
+async def generate_embeddings():
+    async with websockets.connect('ws://localhost:8000/api/vector-embeddings') as ws:
         # Send configuration
         await ws.send(json.dumps({
-            "embedding_model": "qwen3-embedding-8b-q4_k_m.gguf",
-            "force_regen": force_regen
+            "embedding_model": "qwen3-embedding-8b-q4_k_m.gguf"
         }))
         
         # Receive messages
@@ -848,6 +849,56 @@ async def generate_embeddings(force_regen=False):
 
 asyncio.run(generate_embeddings())
 ```
+
+**Regenerate specific files:**
+```python
+async def regenerate_files():
+    async with websockets.connect('ws://localhost:8000/api/vector-embeddings') as ws:
+        await ws.send(json.dumps({
+            "file_names": ["image1.jpg", "video2.mp4"]
+        }))
+        
+        async for message in ws:
+            data = json.loads(message)
+            print(f"[{data['type']}] {data['message']}")
+            if data['type'] in ['result', 'error']:
+                break
+
+asyncio.run(regenerate_files())
+```
+
+**Regenerate all files:**
+```python
+async def regenerate_all():
+    async with websockets.connect('ws://localhost:8000/api/vector-embeddings') as ws:
+        await ws.send(json.dumps({
+            "regenerate_all": True
+        }))
+        
+        async for message in ws:
+            data = json.loads(message)
+            print(f"[{data['type']}] {data['message']}")
+            if data['type'] in ['result', 'error']:
+                break
+
+asyncio.run(regenerate_all())
+```
+
+**Behavior:**
+1. Reloads `storage-metadata.json` if it has been modified since last load
+2. Determines which files to process based on parameters
+3. Loads the embedding model (uses `embedding_model` from config)
+4. Generates embeddings for selected files with progress updates
+5. Updates embeddings.json file (preserves existing embeddings not being regenerated)
+6. Applies PCA reduction if `reduced_embedding_size` is configured
+7. Unloads the embedding model
+8. Returns success with total count and processed count
+
+**Use Cases:**
+- **Initial setup**: Connect without parameters to generate embeddings for all new files
+- **After metadata updates**: Use `file_names` to regenerate specific files you edited
+- **Bulk regeneration**: Use `regenerate_all: true` after widespread metadata changes
+- **Keeping up-to-date**: Run periodically without parameters to process newly added files
 
 ---
 
@@ -1216,6 +1267,7 @@ The server automatically uses the models configured in `/api/config`:
 |-------|------|----------|-------------|
 | `message` | string | ✅ | The current user message to process |
 | `history` | array | ❌ | Optional chat history in OpenAI format. If provided, the server uses this history instead of its internal conversation state. Each item must have `role` ("user" or "assistant") and `content` fields |
+| `image_name` | string | ❌ | Optional image filename for visual conversations (when `enable_visual_chat` is true). If provided with `enable_visual_chat: true`, the vision model is used instead of the chat model |
 | `image_name` | string | ❌ | Optional image filename for visual conversations (when `enable_visual_chat` is true) |
 
 **Note:** 
@@ -1284,15 +1336,7 @@ During response generation, the server sends real-time progress updates as the m
 
 **6. Server Returns Structured Response:**
 
-After streaming completes, the chat endpoint returns responses in structured sections:
-
-**Thinking Section:**
-```json
-{
-  "type": "thinking",
-  "message": "Let me search through your photo collection for beach-related images. I'll analyze the tags and metadata to find all beach photos and provide details about when and where they were taken."
-}
-```
+After streaming completes, the chat endpoint returns responses in structured sections. The server automatically sanitizes the response to remove internal reasoning (`<think>` tags) and returns only the user-facing content:
 
 **Conclusion Section:**
 ```json
@@ -1427,7 +1471,7 @@ print(response.json())
 
 # 2. Generate embeddings
 async def generate_embeddings():
-    async with websockets.connect(f"{WS_BASE}/api/generate-embeddings") as ws:
+    async with websockets.connect(f"{WS_BASE}/api/vector-embeddings") as ws:
         await ws.send(json.dumps({
             "embedding_model": "qwen3-embedding-8b-q4_k_m.gguf"
         }))

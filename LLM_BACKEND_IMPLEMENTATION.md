@@ -11,7 +11,7 @@ This document summarizes how the AI Server handles LLM operations across differe
 The server supports two LLM backend modes controlled by `llm_mode` (or `backend`) configuration:
 
 #### Server Mode (`llm_mode: "server"`)
-- **Binary**: `llama-server` (persistent process on port 8080)
+- **Binary**: `llama-server` (persistent process on port 8100)
 - **Applied to**: Chat and embedding tasks
 - **Advantages**:
   - Models stay loaded between requests

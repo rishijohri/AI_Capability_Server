@@ -65,7 +65,7 @@ def create_app() -> FastAPI:
                 "config": "/api/config",
                 "set_storage_metadata": "/api/set-storage-metadata",
                 "load_rag": "/api/load-rag",
-                "generate_embeddings": "/api/generate-embeddings (WebSocket)",
+                "vector_embeddings": "/api/vector-embeddings (WebSocket)",
                 "generate_rag": "/api/generate-rag (WebSocket)",
                 "tag": "/api/tag (WebSocket)",
                 "describe": "/api/describe (WebSocket)",

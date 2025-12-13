@@ -1,12 +1,11 @@
 """Data models for AI Server."""
 
 from .metadata import FileMetadata, MetadataStore
-from .requests import (
+from app.models.requests import (
     ConfigUpdateRequest,
     StorageMetadataRequest,
     TagRequest,
     DescribeRequest,
-    RegenerateEmbeddingsRequest,
     ChatMessage,
     ChatRequest
 )
@@ -23,7 +22,6 @@ __all__ = [
     "StorageMetadataRequest",
     "TagRequest",
     "DescribeRequest",
-    "RegenerateEmbeddingsRequest",
     "ChatMessage",
     "ChatRequest",
     "ConfigResponse",

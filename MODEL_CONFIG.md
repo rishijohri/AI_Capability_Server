@@ -77,7 +77,7 @@ You can override this in configuration:
 The server supports two LLM backend modes via the `llm_mode` (or `backend`) configuration:
 
 ### Server Mode (`llm_mode: "server"`)
-- **Uses**: `llama-server` binary (persistent process on port 8080)
+- **Uses**: `llama-server` binary (persistent process on port 8100)
 - **Applied to**: **All LLM tasks** - chat, embeddings, and vision
 - **Behavior**: 
   - Starts a persistent llama-server process
