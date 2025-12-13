@@ -144,11 +144,17 @@ def check_binaries():
     """Check if binaries exist."""
     print_header("Checking Binaries")
     
+    import platform
+    
+    # Determine binary extension based on platform
+    is_windows = platform.system() == "Windows"
+    ext = ".exe" if is_windows else ""
+    
     binaries = [
-        "binary/llama-server",
-        "binary/llama-cli",
-        "binary/llama-mtmd-cli",
-        "binary/llama-qwen2vl-cli",
+        f"binary/llama-server{ext}",
+        f"binary/llama-cli{ext}",
+        f"binary/llama-mtmd-cli{ext}",
+        f"binary/llama-embedding{ext}",
     ]
     
     warnings = []
@@ -158,17 +164,31 @@ def check_binaries():
         exists = path.exists()
         if exists:
             found_count += 1
-            executable = path.stat().st_mode & 0o111
-            if executable:
-                print(f"{check_mark(True)} {binary} (executable)")
+            if is_windows:
+                # On Windows, .exe files are automatically executable
+                print(f"{check_mark(True)} {binary}")
             else:
-                print(f"{YELLOW}⚠{RESET} {binary} (not executable)")
-                warnings.append(f"Make {binary} executable: chmod +x {binary}")
+                # On Unix-like systems, check executable bit
+                executable = path.stat().st_mode & 0o111
+                if executable:
+                    print(f"{check_mark(True)} {binary} (executable)")
+                else:
+                    print(f"{YELLOW}⚠{RESET} {binary} (not executable)")
+                    warnings.append(f"Make {binary} executable: chmod +x {binary}")
         else:
             print(f"{YELLOW}⚠{RESET} {binary} - Not found (optional)")
     
     if found_count == 0:
-        warnings.append("No binaries found in binary/ directory")
+        if is_windows:
+            warnings.append("No binaries found in binary/ directory. Add .exe binaries for Windows.")
+        else:
+            warnings.append("No binaries found in binary/ directory. Add binaries and run: chmod +x binary/*")
+    
+    # Platform-specific note
+    if is_windows:
+        print(f"\n{BLUE}Note:{RESET} Windows detected - expecting .exe binaries")
+    else:
+        print(f"\n{BLUE}Note:{RESET} Unix-like system detected - expecting binaries without extensions")
     
     return warnings
 

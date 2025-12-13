@@ -4,9 +4,27 @@ A comprehensive, modular backend AI server with RAG (Retrieval Augmented Generat
 
 ## 🎯 Quick Start
 
+### macOS/Linux
+
 ```bash
 # 1. Activate virtual environment
 source venv/bin/activate
+
+# 2. Make binaries executable
+chmod +x binary/*
+
+# 3. Validate setup
+python validate.py
+
+# 4. Run the server
+python run_server.py
+```
+
+### Windows
+
+```powershell
+# 1. Activate virtual environment
+venv\Scripts\activate
 
 # 2. Validate setup
 python validate.py
@@ -17,6 +35,15 @@ python run_server.py
 
 Server will start at: **http://127.0.0.1:8000**  
 API docs available at: **http://127.0.0.1:8000/docs**
+
+## 🖥️ Platform Support
+
+**Cross-Platform Compatible** - Works on Windows, macOS, and Linux
+
+- **Windows**: Use `.exe` binaries in `binary/` directory
+- **macOS/Linux**: Use standard binaries (no extension) and ensure they're executable
+
+See **[WINDOWS_SUPPORT.md](WINDOWS_SUPPORT.md)** for detailed cross-platform information.
 
 ## 📚 Documentation
 
@@ -49,33 +76,73 @@ AI_Capability/
 ├── venv/                     # Python virtual environment
 ├── run_server.py            # Server startup
 ├── validate.py              # Setup validation
-├── build.sh                 # Build script
+├── build.sh                 # Build script (macOS/Linux)
+├── build.ps1                # Build script (Windows PowerShell)
+├── build.bat                # Build script (Windows Batch)
 ├── example_client.py        # Example client
-└── ai_server.spec          # PyInstaller spec
+└── ai_capability.spec       # PyInstaller spec
 ```
 
 ## 🚀 Building Executable
 
+### macOS/Linux
 ```bash
-# Using build script
+# Using build script (recommended)
 ./build.sh
 
 # Or manually
-pyinstaller ai_server.spec
-
-# Run executable
-./dist/ai_server/ai_server
+pyinstaller ai_capability.spec
 ```
+
+### Windows
+```powershell
+# Using PowerShell script (recommended)
+.\build.ps1
+
+# Or using batch script
+build.bat
+
+# Or manually
+pyinstaller ai_capability.spec
+```
+
+### Running the Executable
+
+**macOS/Linux:**
+```bash
+./dist/ai_capability_server/ai_capability_server
+```
+
+**Windows:**
+```powershell
+.\dist\ai_capability_server\ai_capability_server.exe
+```
+
+See **[WINDOWS_SUPPORT.md](WINDOWS_SUPPORT.md)** for detailed build instructions.
 
 ## 📋 Prerequisites
 
 ### Required
+
+**Python & Environment:**
 - Python 3.8+
-- Llama binaries in `binary/` folder:
-  - `llama-server`
-  - `llama-cli`
-  - `llama-mtmd-cli`
-- Model files (.gguf) in `model/` folder
+
+**Binaries (in `binary/` folder):**
+
+*Windows:*
+- `llama-server.exe`
+- `llama-cli.exe`
+- `llama-mtmd-cli.exe`
+- `llama-embedding.exe`
+
+*macOS/Linux:*
+- `llama-server`
+- `llama-cli`
+- `llama-mtmd-cli`
+- `llama-embedding`
+
+**Models (in `model/` folder):**
+- Model files (.gguf)
 - MMProj files for vision models
 
 ### Already Installed

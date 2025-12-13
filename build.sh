@@ -1,13 +1,32 @@
 #!/bin/bash
 
-# AI Capability Server - Build Script
+# AI Capability Server - Build Script (macOS/Linux)
 # This script builds the standalone executable using PyInstaller
 
 set -e  # Exit on error
 
 echo "============================================================"
-echo "AI Capability Server - Build Script"
+echo "AI Capability Server - Build Script (macOS/Linux)"
 echo "============================================================"
+
+# Detect if running on Windows (Git Bash, WSL, etc.)
+if [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "win32" ]] || [[ "$OSTYPE" == "cygwin" ]]; then
+    echo ""
+    echo "⚠️  Windows detected!"
+    echo ""
+    echo "This is a Unix shell script. On Windows, please use:"
+    echo "  - PowerShell: .\build.ps1"
+    echo "  - Command Prompt: build.bat"
+    echo ""
+    echo "If you're in Git Bash or WSL, this script may work but"
+    echo "native Windows scripts are recommended."
+    echo ""
+    read -p "Continue with bash script anyway? (y/n): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 0
+    fi
+fi
 
 # Check if virtual environment is activated
 if [ -z "$VIRTUAL_ENV" ]; then

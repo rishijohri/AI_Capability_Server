@@ -2,6 +2,7 @@
 
 import subprocess
 import asyncio
+import platform
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 import signal
@@ -149,14 +150,24 @@ class ProcessManager:
             
         Returns:
             Number of processes killed
+        
+        Note:
+            On Windows, automatically checks for .exe extension.
+            On macOS/Linux, checks exact name.
         """
         killed_count = 0
+        
+        # On Windows, check for both with and without .exe extension
+        binary_names = [binary_name]
+        if platform.system() == "Windows":
+            if not binary_name.endswith(".exe"):
+                binary_names.append(f"{binary_name}.exe")
         
         try:
             for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
                 try:
-                    # Check if process name matches
-                    if proc.info['name'] == binary_name:
+                    # Check if process name matches any variant
+                    if proc.info['name'] in binary_names:
                         proc.kill()
                         killed_count += 1
                         continue

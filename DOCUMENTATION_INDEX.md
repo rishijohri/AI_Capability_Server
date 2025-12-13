@@ -75,6 +75,20 @@ Complete documentation for the AI Server project.
 
 ---
 
+### [WINDOWS_SUPPORT.md](WINDOWS_SUPPORT.md)
+**Cross-platform compatibility guide** covering:
+- Windows vs macOS/Linux differences
+- Binary structure and naming conventions
+- Automatic platform detection
+- Process management across platforms
+- PyInstaller cross-platform building
+- Platform-specific deployment notes
+- Troubleshooting cross-platform issues
+
+**Best for** deploying on Windows or understanding platform differences.
+
+---
+
 ### [LLM_BACKEND_IMPLEMENTATION.md](LLM_BACKEND_IMPLEMENTATION.md)
 **Technical backend documentation** covering:
 - Backend architecture (server vs CLI mode)
@@ -124,6 +138,9 @@ Complete documentation for the AI Server project.
 
 **...verify parameter application**
 → [LLM_BACKEND_IMPLEMENTATION.md](LLM_BACKEND_IMPLEMENTATION.md#verification)
+
+**...deploy on Windows**
+→ [WINDOWS_SUPPORT.md](WINDOWS_SUPPORT.md)
 
 **...troubleshoot an issue**
 → [README_AI_SERVER.md](README_AI_SERVER.md#troubleshooting) or [QUICKSTART.md](QUICKSTART.md#common-issues)

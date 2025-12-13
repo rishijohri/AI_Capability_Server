@@ -2,6 +2,7 @@
 
 import sys
 import os
+import platform
 from pathlib import Path
 
 
@@ -53,7 +54,15 @@ def get_binary_path(binary_name: str) -> Path:
     
     Returns:
         Path: Absolute path to the binary
+    
+    Note:
+        On Windows, automatically appends .exe extension if not already present.
+        On macOS/Linux, uses the binary name as-is.
     """
+    # Append .exe extension on Windows if not already present
+    if platform.system() == "Windows" and not binary_name.endswith(".exe"):
+        binary_name = f"{binary_name}.exe"
+    
     return get_resource_path(f"binary/{binary_name}")
 
 
