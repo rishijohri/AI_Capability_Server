@@ -27,7 +27,6 @@ wheels/
 *.manifest
 
 # IDEs
-.vscode/
 .idea/
 *.swp
 *.swo

@@ -156,6 +156,11 @@ model_options = [
                 "batch_size": 8192,
                 "ubatch_size": 1024
             }
+        },
+        {
+            "name": "qwen_3_4B",
+            "type": "embedding",
+            "model_file":"Qwen3-Embedding-4B-Q4_K_M.gguf",
         }
 ]
 
@@ -213,7 +218,7 @@ class ServerConfig(BaseModel):
         description="Chat/conversation model filename"
     )
     embedding_model: str = Field(
-        default="qwen3-embedding-8b-q4_k_m.gguf",
+        default="Qwen3-Embedding-4B-Q4_K_M.gguf",
         description="Embedding model filename"
     )
     vision_model: str = Field(
