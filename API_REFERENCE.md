@@ -19,7 +19,8 @@ The `llm_mode` (or `backend`) configuration controls which LLM backend is used f
   - Better performance with persistent process
   
 - **`cli` mode**: Uses specialized binaries per-request for chat, embeddings, **and vision tasks**
-  - Chat/embeddings use `llama-cli`
+  - Chat uses `llama-cli`
+  - Embeddings use `llama-embedding`
   - Vision tasks use `llama-mtmd-cli` with image file input
   - Lower memory footprint
 
@@ -65,6 +66,7 @@ The `fileName` field in `storage_metadata.json` should contain only the filename
 | `/api/tag` | WebSocket | Generate tags for media |
 | `/api/describe` | WebSocket | Generate descriptions for media |
 | `/api/chat` | WebSocket | Chat with RAG context |
+| `/api/cloud-chat` | WebSocket | Get RAG context for external cloud LLM |
 
 ---
 
@@ -1370,6 +1372,8 @@ The server automatically uses the models configured in `/api/config`:
 - The `history` parameter is **required** for maintaining context across multiple connections
 - **RAG Search with History**: When searching the knowledge base, the system includes the conversation history in the embedding vector. The search query is formatted as: `user: "query1", assistant: "response1", user: "query2", ...`, ending with the latest user message. This provides better context-aware retrieval.
 
+**Related Endpoint:** For using external cloud LLMs (OpenAI, Anthropic, etc.) instead of local models, see `/api/cloud-chat` which provides RAG context without running inference.
+
 **4. Server Searches and Generates:**
 ```json
 {
@@ -1541,6 +1545,363 @@ Invalid history role:
 - Uses RAG to provide context from your files
 - Returns relevant files with similarity scores
 - Supports both text and visual conversations (when `enable_visual_chat` is enabled)
+
+---
+
+### WS /api/cloud-chat
+
+Get RAG context and system prompt for use with external cloud LLMs (OpenAI, Anthropic, Google, etc.). This endpoint performs RAG search and returns structured context without running any local LLM inference. The client is responsible for calling their chosen cloud LLM provider.
+
+**Use Case:** Ideal when you want to use powerful cloud models (GPT-4, Claude, Gemini) while leveraging the server's RAG capabilities for context-aware responses about your local files.
+
+**Connection:** `ws://localhost:8000/api/cloud-chat`
+
+**1. Client Connects (No Initial Configuration Required)**
+
+**2. Server Loads Embedding Model:**
+```json
+{
+  "type": "status",
+  "message": "Loading RAG database..."
+}
+```
+
+```json
+{
+  "type": "status",
+  "message": "Loading embedding model embeddinggemma-300M-Q8_0.gguf..."
+}
+```
+
+```json
+{
+  "type": "status",
+  "message": "Ready to provide RAG context. Send your message."
+}
+```
+
+**3. Client Sends Message:**
+
+**Basic Request:**
+```json
+{
+  "message": "What beach photos do I have?"
+}
+```
+
+**With Conversation History:**
+```json
+{
+  "message": "Show me the sunset ones",
+  "history": [
+    {
+      "role": "user",
+      "content": "What beach photos do I have?"
+    },
+    {
+      "role": "assistant",
+      "content": "You have 12 beach photos in your collection..."
+    }
+  ]
+}
+```
+
+**With Image Context:**
+```json
+{
+  "message": "Tell me about this photo",
+  "image_name": "beach_sunset.jpg",
+  "history": []
+}
+```
+
+**Message Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `message` | string | ✅ | The current user message to search for |
+| `history` | array | ❌ | Optional chat history in OpenAI format. Used to build context-aware search query |
+| `image_name` | string | ❌ | Optional image filename for visual context (loads tags, description, and base64 image) |
+
+**4. Server Performs RAG Search:**
+```json
+{
+  "type": "status",
+  "message": "Searching knowledge base..."
+}
+```
+
+**5. Server Returns Complete Context Package:**
+```json
+{
+  "type": "result",
+  "message": "RAG context retrieved successfully",
+  "data": {
+    "system_prompt": "You are Persona, a helpful AI assistant...",
+    "rag_context": "File: vacation/beach_sunset.jpg\nTags: beach, sunset, ocean, vacation\nDescription: A beautiful sunset over the ocean...\nSimilarity: 0.892\n\nFile: summer/surfing_day.jpg\nTags: beach, surfing, sports, summer\nDescription: Action shot of surfer riding a wave...\nSimilarity: 0.845",
+    "relevant_files": [
+      "vacation/beach_sunset.jpg",
+      "summer/surfing_day.jpg"
+    ],
+    "file_details": [
+      {
+        "fileName": "vacation/beach_sunset.jpg",
+        "similarity": 0.892
+      },
+      {
+        "fileName": "summer/surfing_day.jpg",
+        "similarity": 0.845
+      }
+    ],
+    "image_context": null,
+    "user_message": "What beach photos do I have?",
+    "history": []
+  }
+}
+```
+
+**Response Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `system_prompt` | string | The configured chat system prompt from server config |
+| `rag_context` | string | Formatted text with relevant file information, ready to be included in your LLM prompt |
+| `relevant_files` | array[string] | List of relevant filenames |
+| `file_details` | array[object] | Detailed similarity scores for each file |
+| `image_context` | object/null | If `image_name` provided: contains `image_name`, `tags`, `description`, and `image_base64` |
+| `user_message` | string | Echo of the user's message |
+| `history` | array/null | Echo of the provided conversation history |
+
+**6. Connection Closes**
+
+**With Image Context Response:**
+```json
+{
+  "type": "result",
+  "message": "RAG context retrieved successfully",
+  "data": {
+    "system_prompt": "You are Persona...",
+    "rag_context": "File: vacation/beach_sunset.jpg...",
+    "relevant_files": ["vacation/beach_sunset.jpg"],
+    "file_details": [...],
+    "image_context": {
+      "image_name": "beach_sunset.jpg",
+      "tags": ["beach", "sunset", "ocean"],
+      "description": "A beautiful sunset over the ocean with palm trees",
+      "image_base64": "iVBORw0KGgoAAAANSUhEUgAA..."
+    },
+    "user_message": "Tell me about this photo",
+    "history": []
+  }
+}
+```
+
+**Error Cases:**
+
+RAG not available:
+```json
+{
+  "type": "error",
+  "message": "RAG not available. Generate RAG first."
+}
+```
+
+Invalid history format:
+```json
+{
+  "type": "error",
+  "message": "history parameter must be a list of message objects"
+}
+```
+
+Image not found:
+```json
+{
+  "type": "error",
+  "message": "File not found: unknown.jpg"
+}
+```
+
+**Usage Example with OpenAI:**
+
+```python
+import asyncio
+import websockets
+import json
+import openai
+
+async def cloud_chat_with_openai():
+    # 1. Get RAG context from AI Server
+    async with websockets.connect('ws://localhost:8000/api/cloud-chat') as ws:
+        # Wait for ready
+        while True:
+            message = await ws.recv()
+            data = json.loads(message)
+            if "ready" in data['message'].lower():
+                break
+        
+        # Send request
+        await ws.send(json.dumps({
+            "message": "What photos do I have from my vacation?",
+            "history": []
+        }))
+        
+        # Get context
+        async for message in ws:
+            data = json.loads(message)
+            if data['type'] == 'result':
+                context_data = data['data']
+                break
+    
+    # 2. Call OpenAI with the context
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[
+            {
+                "role": "system",
+                "content": context_data['system_prompt']
+            },
+            {
+                "role": "system",
+                "content": f"Relevant files from user's collection:\n\n{context_data['rag_context']}"
+            },
+            {
+                "role": "user",
+                "content": context_data['user_message']
+            }
+        ]
+    )
+    
+    print(response.choices[0].message.content)
+
+asyncio.run(cloud_chat_with_openai())
+```
+
+**Usage Example with Anthropic Claude:**
+
+```python
+import asyncio
+import websockets
+import json
+import anthropic
+
+async def cloud_chat_with_claude():
+    # Get RAG context
+    async with websockets.connect('ws://localhost:8000/api/cloud-chat') as ws:
+        while True:
+            message = await ws.recv()
+            data = json.loads(message)
+            if "ready" in data['message'].lower():
+                break
+        
+        await ws.send(json.dumps({
+            "message": "Describe my beach photos",
+            "history": []
+        }))
+        
+        async for message in ws:
+            data = json.loads(message)
+            if data['type'] == 'result':
+                context_data = data['data']
+                break
+    
+    # Call Claude
+    client = anthropic.Anthropic()
+    message = client.messages.create(
+        model="claude-3-5-sonnet-20241022",
+        max_tokens=1024,
+        system=f"{context_data['system_prompt']}\n\nRelevant files:\n{context_data['rag_context']}",
+        messages=[
+            {
+                "role": "user",
+                "content": context_data['user_message']
+            }
+        ]
+    )
+    
+    print(message.content[0].text)
+
+asyncio.run(cloud_chat_with_claude())
+```
+
+**Multi-turn Conversation Example:**
+
+```python
+async def multi_turn_cloud_chat():
+    conversation_history = []
+    
+    # First turn
+    async with websockets.connect('ws://localhost:8000/api/cloud-chat') as ws:
+        # Wait for ready and send first message
+        while True:
+            message = await ws.recv()
+            data = json.loads(message)
+            if "ready" in data['message'].lower():
+                break
+        
+        await ws.send(json.dumps({
+            "message": "What vacation photos do I have?",
+            "history": conversation_history
+        }))
+        
+        # Get context
+        async for message in ws:
+            data = json.loads(message)
+            if data['type'] == 'result':
+                first_context = data['data']
+                break
+    
+    # Call your cloud LLM
+    first_response = call_your_llm(first_context)  # Your LLM call
+    
+    # Add to history
+    conversation_history.append({
+        "role": "user",
+        "content": "What vacation photos do I have?"
+    })
+    conversation_history.append({
+        "role": "assistant",
+        "content": first_response
+    })
+    
+    # Second turn with history
+    async with websockets.connect('ws://localhost:8000/api/cloud-chat') as ws:
+        while True:
+            message = await ws.recv()
+            data = json.loads(message)
+            if "ready" in data['message'].lower():
+                break
+        
+        await ws.send(json.dumps({
+            "message": "Show me the beach ones",
+            "history": conversation_history  # Include previous conversation
+        }))
+        
+        async for message in ws:
+            data = json.loads(message)
+            if data['type'] == 'result':
+                second_context = data['data']
+                break
+    
+    # Call your cloud LLM with updated context
+    second_response = call_your_llm(second_context)
+```
+
+**Features:**
+- **No local LLM inference**: Server only performs RAG search, client calls cloud LLM
+- **Conversation history support**: Include previous turns for context-aware RAG search
+- **Image context**: Load image metadata and base64 data for multimodal cloud models
+- **Flexible**: Use with any cloud LLM provider (OpenAI, Anthropic, Google, Cohere, etc.)
+- **Cost-effective**: Leverage powerful cloud models while using local RAG for privacy-sensitive file indexing
+- **Lower latency for RAG**: Local embedding search is faster than cloud-based retrieval
+
+**When to Use:**
+- You want to use GPT-4, Claude, or other cloud models for better response quality
+- You need features only available in cloud models (longer context, better reasoning)
+- You want to keep file indexing local but use cloud models for conversation
+- You're building a production application with commercial cloud LLM APIs
+
+**Related Endpoint:** For fully local chat using server's LLM, see `/api/chat`
 
 ---
 
@@ -1717,6 +2078,46 @@ async def chat_with_history():
         # Connection closes automatically
 
 asyncio.run(chat_with_history())
+
+# 5c. Cloud Chat (Get RAG context for external LLM)
+async def cloud_chat():
+    async with websockets.connect(f"{WS_BASE}/api/cloud-chat") as ws:
+        # Wait for ready
+        while True:
+            message = await ws.recv()
+            data = json.loads(message)
+            print(f"[{data['type']}] {data['message']}")
+            if "ready" in data['message'].lower():
+                break
+        
+        # Send message
+        await ws.send(json.dumps({
+            "message": "What photos do I have from the beach?",
+            "history": []
+        }))
+        
+        # Get RAG context
+        async for message in ws:
+            data = json.loads(message)
+            print(f"[{data['type']}] {data['message']}")
+            
+            if data['type'] == 'result':
+                # Use this context with your cloud LLM (OpenAI, Anthropic, etc.)
+                system_prompt = data['data']['system_prompt']
+                rag_context = data['data']['rag_context']
+                relevant_files = data['data']['relevant_files']
+                user_message = data['data']['user_message']
+                
+                print(f"\nSystem Prompt: {system_prompt[:100]}...")
+                print(f"\nRAG Context:\n{rag_context}")
+                print(f"\nRelevant Files: {', '.join(relevant_files)}")
+                
+                # Now call your cloud LLM with this context
+                # Example: openai.ChatCompletion.create(...)
+                break
+        # Connection closes automatically
+
+asyncio.run(cloud_chat())
 
 # 6. Detect faces (optional)
 response = requests.post(f"{BASE_URL}/api/detect-faces", json={

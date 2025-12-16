@@ -240,15 +240,15 @@ class ServerConfig(BaseModel):
         description="Chat/conversation model filename"
     )
     embedding_model: str = Field(
-        default=model_options["gemma3_300m"]["model_file"],
+        default=model_options["qwen_3_4B"]["model_file"],
         description="Embedding model filename"
     )
     vision_model: str = Field(
-        default = model_options["gemma_3_4b_1Q"]["model_file"],
+        default = model_options["gemma3_4b_q4_k_m"]["model_file"],
         description="Vision model filename"
     )
     mmproj_model: str = Field(
-        default=model_options["gemma_3_4b_1Q"]["mmproj_file"],
+        default=model_options["gemma3_4b_q4_k_m"]["mmproj_file"],
         description="MMProj model filename for vision"
     )
     

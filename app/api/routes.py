@@ -51,6 +51,34 @@ def get_metadata_store() -> MetadataStore:
     return _metadata_store
 
 
+def build_rag_context_from_results(relevant_files: list[FileMetadata]) -> tuple[str, list[str]]:
+    """
+    Build formatted RAG context and file list from search results.
+    
+    Args:
+        relevant_files: List of FileMetadata objects from RAG search
+        
+    Returns:
+        Tuple of (formatted_context_string, list_of_filenames)
+    """
+    context_parts = ["Here are relevant files from the knowledge base:\n"]
+    file_list = []
+    
+    for file_meta in relevant_files:
+        context_parts.append(f"- {file_meta.fileName}")
+        context_parts.append(f"  Type: {file_meta.type}")
+        if file_meta.creationTime:
+            context_parts.append(f"  Created: {file_meta.creationTime}")
+        context_parts.append(f"  Tags: {', '.join(file_meta.tags)}")
+        if file_meta.description:
+            context_parts.append(f"  Description: {file_meta.description}")
+        context_parts.append("")
+        file_list.append(file_meta.fileName)
+    
+    context = "\n".join(context_parts)
+    return context, file_list
+
+
 @router.get("/config", response_model=ConfigResponse)
 async def get_configuration():
     """Get current configuration."""
@@ -1228,19 +1256,8 @@ async def chat_ws(websocket: WebSocket):
         
         relevant_files = await rag_service.search(search_query)
         
-        # Build context from RAG results with file creation dates
-        context_parts = ["Here are relevant files from the knowledge base:\n"]
-        for file_meta in relevant_files:
-            context_parts.append(f"- {file_meta.fileName}")
-            context_parts.append(f"  Type: {file_meta.type}")
-            if file_meta.creationTime:
-                context_parts.append(f"  Created: {file_meta.creationTime}")
-            context_parts.append(f"  Tags: {', '.join(file_meta.tags)}")
-            if file_meta.description:
-                context_parts.append(f"  Description: {file_meta.description}")
-            context_parts.append("")
-        
-        context = "\n".join(context_parts)
+        # Build context from RAG results using shared helper function
+        context, _ = build_rag_context_from_results(relevant_files)
         
         # Now load the chat/vision model for generation
         model_type = "vision" if use_vision else "chat"
@@ -1501,6 +1518,218 @@ async def chat_ws(websocket: WebSocket):
         # Ensure cleanup happens even if error during error handling
         if generation_task and not generation_task.done():
             generation_task.cancel()
+        await websocket.close()
+
+
+@router.websocket("/cloud-chat")
+async def cloud_chat_ws(websocket: WebSocket):
+    """Cloud chat endpoint - provides RAG context and system prompt for external LLM calls."""
+    await websocket.accept()
+    
+    try:
+        # Get configuration
+        config = get_config()
+        llm_service = get_llm_service()
+        
+        embedding_model = config.embedding_model
+        
+        metadata_store = get_metadata_store()
+        rag_service = get_rag_service()
+        
+        # Check if metadata file has been updated and reload if necessary
+        if await metadata_store.reload_if_modified():
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message="Storage metadata file was updated. Reloaded metadata."
+                ).to_json()
+            )
+        
+        # Ensure RAG is loaded
+        if not rag_service.is_loaded():
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message="Loading RAG database..."
+                ).to_json()
+            )
+            if not rag_service.load_rag(metadata_store):
+                raise ValueError("RAG not available. Generate RAG first.")
+        
+        # Load embedding model for RAG search
+        await websocket.send_json(
+            WebSocketMessage(
+                type="status",
+                message=f"Loading embedding model {embedding_model}..."
+            ).to_json()
+        )
+        
+        await llm_service.load_model(embedding_model)
+        
+        await websocket.send_json(
+            WebSocketMessage(
+                type="status",
+                message="Ready to provide RAG context. Send your message."
+            ).to_json()
+        )
+        
+        # Receive user message
+        msg_data = await websocket.receive_json()
+        
+        user_message = msg_data.get("message")
+        image_name = msg_data.get("image_name")  # Optional image for visual context
+        provided_history = msg_data.get("history")  # Optional chat history
+        
+        if not user_message:
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="error",
+                    message="No message provided"
+                ).to_json()
+            )
+            return
+        
+        # Validate history format if provided
+        if provided_history is not None:
+            if not isinstance(provided_history, list):
+                await websocket.send_json(
+                    WebSocketMessage(
+                        type="error",
+                        message="history parameter must be a list of message objects"
+                    ).to_json()
+                )
+                return
+            for msg in provided_history:
+                if not isinstance(msg, dict) or "role" not in msg or "content" not in msg:
+                    await websocket.send_json(
+                        WebSocketMessage(
+                            type="error",
+                            message="Each history item must be a dict with 'role' and 'content' keys"
+                        ).to_json()
+                    )
+                    return
+        
+        # Handle image context if provided
+        image_base64 = None
+        image_tags = []
+        image_description = None
+        if image_name:
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message=f"Loading image context: {image_name}..."
+                ).to_json()
+            )
+            
+            # Get image metadata
+            image_metadata = metadata_store.get_metadata_by_filename(image_name)
+            if image_metadata:
+                image_tags = image_metadata.tags
+                image_description = image_metadata.description
+            
+            # Load image
+            from app.utils import ImageProcessor
+            image_base64, error_msg = await ImageProcessor.load_image_as_base64(
+                image_name, 
+                metadata_store, 
+                config.image_quality
+            )
+            
+            if error_msg:
+                await websocket.send_json(
+                    WebSocketMessage(
+                        type="error",
+                        message=error_msg
+                    ).to_json()
+                )
+                return
+        
+        # Perform RAG search
+        await websocket.send_json(
+            WebSocketMessage(
+                type="status",
+                message="Searching knowledge base..."
+            ).to_json()
+        )
+        
+        # Build search query with history if provided
+        if provided_history:
+            # Format history for embedding: "user: query1, assistant: response1, user: query2, ..."
+            history_text = ", ".join([
+                f"{msg['role']}: \"{msg['content']}\""
+                for msg in provided_history
+            ])
+            search_query = f"{history_text}, user: \"{user_message}\""
+        else:
+            search_query = user_message
+        
+        # Search RAG
+        relevant_files = await rag_service.search(
+            search_query,
+            k=config.top_k
+        )
+        
+        # Build context from relevant files using shared helper function
+        rag_context, file_list = build_rag_context_from_results(relevant_files)
+        
+        # Build image context if available
+        image_context = None
+        if image_name and (image_tags or image_description):
+            image_context = {
+                "image_name": image_name,
+                "tags": image_tags,
+                "description": image_description,
+                "image_base64": image_base64
+            }
+        
+        # Send the complete context package
+        await websocket.send_json(
+            WebSocketMessage(
+                type="result",
+                message="RAG context retrieved successfully",
+                data={
+                    "system_prompt": config.chat_system_prompt,
+                    "rag_context": rag_context,
+                    "relevant_files": file_list,
+                    "file_details": [
+                        {
+                            "fileName": f.fileName,
+                            "type": f.type,
+                            "tags": f.tags,
+                            "description": f.description,
+                            "creationTime": f.creationTime
+                        } for f in relevant_files
+                    ],
+                    "image_context": image_context,
+                    "user_message": user_message,
+                    "history": provided_history
+                }
+            ).to_json()
+        )
+        
+        # Unload embedding model
+        await llm_service.unload_model()
+        
+    except WebSocketDisconnect:
+        # Client disconnected
+        if llm_service:
+            await llm_service.unload_model()
+    except Exception as e:
+        error_details = {
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "traceback": traceback.format_exc()
+        }
+        await websocket.send_json(
+            WebSocketMessage(
+                type="error",
+                message=f"Cloud chat error: {type(e).__name__}: {str(e)}",
+                data=error_details
+            ).to_json()
+        )
+        if llm_service:
+            await llm_service.unload_model()
+    finally:
         await websocket.close()
 
 
