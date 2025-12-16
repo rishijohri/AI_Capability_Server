@@ -342,7 +342,8 @@ class LlamaCLIBackend(LLMBackend):
             "--ubatch-size", str(config.llm_params.ubatch_size),
             "--n-gpu-layers", str(config.llm_params.n_gpu_layers)
         ]
-        
+        print("Running LLM CLI Command", command)
+        # Add mmproj if stored
         if self._mmproj_path:
             command.extend(["--mmproj", str(self._mmproj_path)])
         

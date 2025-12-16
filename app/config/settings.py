@@ -21,8 +21,8 @@ class LLMParams(BaseModel):
     ubatch_size: int = Field(default=512, description="Micro-batch size")
     n_gpu_layers: int = Field(default=999, description="Number of GPU layers to offload")
 
-model_options = [
-        {
+model_options = {
+        "qwen_2.5_vl": { 
             "name": "qwen_2.5_vl",
             "type": "vision",
             "model_file": "Qwen2.5-VL-7B-Instruct-UD-IQ2_M.gguf",
@@ -39,7 +39,7 @@ model_options = [
                 "ubatch_size": 1024
             }
         },
-        {
+        "qwen_3": {
             "name": "qwen_3",
             "type": "chat",
             "model_file": "Qwen3-8B-Q4_K_M.gguf",
@@ -56,7 +56,7 @@ model_options = [
             }
             
         },
-        {
+       "qwen_3_embedding": {
             "name": "qwen_3_embedding",
             "type": "embedding",
             "model_file":"qwen3-embedding-8b-q4_k_m.gguf",
@@ -72,7 +72,7 @@ model_options = [
                 "ubatch_size": 1024
             }
         },
-        {
+       "mini_cpm_4.5_km": {
             "name": "MiniCPM4.5_KM",
             "type": "vision",
             # "model_file": "ggml-model-Q4_0.gguf",
@@ -90,7 +90,7 @@ model_options = [
                 "ubatch_size": 1024
             }
         },
-        {
+       "mini_cpm_4.5_ks": {
             "name": "MiniCPM4.5_KS",
             "type": "vision",
             # "model_file": "ggml-model-Q4_0.gguf",
@@ -108,7 +108,7 @@ model_options = [
                 "ubatch_size": 1024
             }
         },
-        {
+       "granite4_micro": {
             "name": "granite4_micro",
             "type": "chat",
             "model_file": "granite4-7b-q4k.gguf",
@@ -124,7 +124,7 @@ model_options = [
                 "ubatch_size": 1024
             }
         },
-        {
+       "granite4_350m": {
             "name": "granite4_350m",
             "type": "chat",
             "model_file": "granite-4.0-350m-UD-Q6_K_XL.gguf",
@@ -140,7 +140,7 @@ model_options = [
                 "ubatch_size": 1024
             }
         },
-        {
+       "llava_phi3_4k": {
             "name": "llava_phi3_4k",
             "type": "vision",
             "model_file": "llava-phi3-mini-Q4_K_M.gguf",
@@ -157,12 +157,34 @@ model_options = [
                 "ubatch_size": 1024
             }
         },
-        {
+       "qwen_3_4B": {
             "name": "qwen_3_4B",
             "type": "embedding",
             "model_file":"Qwen3-Embedding-4B-Q4_K_M.gguf",
+        },
+       "gemma3_300m": {
+            "name": "gemma3_300m",
+            "type": "embedding",
+            "model_file":"embeddinggemma-300M-Q8_0.gguf",
+        },
+       "gemma_3_4b_1Q": {
+            "model_file": "gemma-3-4b-it-UD-IQ1_S.gguf",
+            "name": "gemma_3_4b_1Q",
+            "type": "vision",
+            "mmproj_file": "gemma_3_mmproj-F16.gguf",
+        },
+       "qwen_3_0.6B": {
+            "model_file": "Qwen3-0.6B-Q4_K_M.gguf",
+            "name": "qwen_3_0.6B",
+            "type": "chat"
+        },
+       "gemma3_4b_q4_k_m": {
+            "name": "gemma3_4b_q4_k_m",
+            "type": "vision",
+            "model_file": "gemma-3-4b-it-Q4_K_M.gguf",
+            "mmproj_file": "gemma_3_mmproj-F16.gguf",
         }
-]
+}
 
 class ServerConfig(BaseModel):
     """AI Server configuration."""
@@ -214,19 +236,19 @@ class ServerConfig(BaseModel):
     
     # Model file names
     chat_model: str = Field(
-        default="Qwen3-8B-Q4_K_M.gguf",
+        default=model_options["qwen_3_0.6B"]["model_file"],
         description="Chat/conversation model filename"
     )
     embedding_model: str = Field(
-        default="Qwen3-Embedding-4B-Q4_K_M.gguf",
+        default=model_options["gemma3_300m"]["model_file"],
         description="Embedding model filename"
     )
     vision_model: str = Field(
-        default = "gemma-3-4b-it-Q4_K_M.gguf",
+        default = model_options["gemma_3_4b_1Q"]["model_file"],
         description="Vision model filename"
     )
     mmproj_model: str = Field(
-        default="gemma_3_mmproj-F16.gguf", # MiniCPM4.5
+        default=model_options["gemma_3_4b_1Q"]["mmproj_file"],
         description="MMProj model filename for vision"
     )
     
