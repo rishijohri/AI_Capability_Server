@@ -55,3 +55,11 @@ class ChatRequest(BaseModel):
     """Chat request."""
     messages: List[ChatMessage]
     stream: bool = Field(default=False, description="Stream responses")
+
+
+class AvailableModelsRequest(BaseModel):
+    """Request to get available models for a specific task type."""
+    task_type: Optional[Literal["vision", "chat", "embedding"]] = Field(
+        None, 
+        description="Filter by task type (vision, chat, embedding). If None, returns all available models."
+    )

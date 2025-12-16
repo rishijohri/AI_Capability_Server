@@ -53,6 +53,7 @@ The `fileName` field in `storage_metadata.json` should contain only the filename
 |----------|------|-------------|
 | `/api/config` | GET | Get current configuration |
 | `/api/config` | POST | Update configuration |
+| `/api/available-models` | GET | Get available models filtered by task type |
 | `/api/set-storage-metadata` | POST | Set metadata file path |
 | `/api/load-rag` | POST | Load RAG database |
 | `/api/kill` | POST | Shutdown server and all processes |
@@ -81,23 +82,24 @@ curl http://localhost:8000/api/config
 **Response:** `200 OK`
 ```json
 {
-  "reduced_embedding_size": 512,
+  "reduced_embedding_size": null,
   "chat_rounds": 3,
-  "image_quality": "medium",
+  "image_quality": 1.0,
   "llm_mode": "server",
   "top_k": 5,
-  "recency_bias": 1.5,
-  "enable_visual_chat": false,
-  "chat_model": "Qwen3-8B-Q4_K_M.gguf",
-  "embedding_model": "qwen3-embedding-8b-q4_k_m.gguf",
-  "vision_model": "Qwen2.5-VL-7B-Instruct-UD-IQ2_M.gguf",
-  "mmproj_model": "mmproj-Qwen2-VL-7B-Instruct-f16.gguf",
-  "chat_system_prompt": "You are Persona, a helpful AI assistant. Provide crisp and concise answers...",
-  "tag_prompt": "List relevant tags for this image as a comma-separated list...",
-  "describe_prompt": "Describe this image in detail, including what you see...",
-  "vision_binary": null,
+  "recency_bias": 1.0,
+  "enable_visual_chat": true,
+  "chat_model": "Qwen3-0.6B-Q4_K_M.gguf",
+  "embedding_model": "embeddinggemma-300M-Q8_0.gguf",
+  "vision_model": "gemma-3-4b-it-UD-IQ1_S.gguf",
+  "mmproj_model": "gemma_3_mmproj-F16.gguf",
+  "chat_system_prompt": "You are Persona, a helpful AI assistant. Provide concise, factual answers...",
+  "tag_prompt": "Analyze this image and generate descriptive tags...",
+  "describe_prompt": "Describe this image in detail...",
+  "vision_binary": "auto",
   "backend": "server",
   "model_timeout": 300,
+  "llm_timeout": 300,
   "llm_params": {
     "ctx_size": 12192,
     "temp": 0.35,
@@ -105,8 +107,9 @@ curl http://localhost:8000/api/config
     "top_k": 40,
     "presence_penalty": 0.2,
     "mirostat": 0,
-    "batch_size": 8192,
-    "ubatch_size": 1024
+    "batch_size": 1024,
+    "ubatch_size": 512,
+    "n_gpu_layers": 999
   },
   "rag_directory_name": "rag",
   "storage_metadata_path": null
@@ -119,10 +122,10 @@ curl http://localhost:8000/api/config
 |-------|------|----------|-------------|
 | `reduced_embedding_size` | int/null | ✅ | Target dimension for PCA reduction (null = no reduction) |
 | `chat_rounds` | int | ✅ | Number of conversation rounds to maintain (1-10) |
-| `image_quality` | float | ✅ | Image scale multiplier: 1.0 = original dimensions, <1.0 = scale down (e.g., 0.5 = half size) |
+| `image_quality` | float | ✅ | Image scale multiplier (0.0-1.0): 1.0 = original dimensions, <1.0 = scale down (e.g., 0.5 = half size) |
 | `llm_mode` | string | ✅ | LLM backend: `server` (persistent) or `cli` (per-request) |
 | `top_k` | int | ✅ | Number of RAG results to retrieve (1-50) |
-| `recency_bias` | float | ✅ | Recency weight in search (1.0 = no bias, >1.0 = favor recent) |
+| `recency_bias` | float | ✅ | Recency weight in search (≥0.1, where 1.0 = no bias, >1.0 = favor recent) |
 | `enable_visual_chat` | bool | ✅ | Enable visual conversation mode (uses vision model for chat with images) |
 | `chat_model` | string | ✅ | Chat model filename |
 | `embedding_model` | string | ✅ | Embedding model filename |
@@ -131,7 +134,7 @@ curl http://localhost:8000/api/config
 | `chat_system_prompt` | string | ✅ | System prompt for chat conversations (XML format with `<think>`, `<conclusion>`, `<files>` tags) |
 | `tag_prompt` | string | ✅ | Prompt template for generating tags (XML format with `<think>` and `<conclusion>` tags) |
 | `describe_prompt` | string | ✅ | Prompt template for generating descriptions (XML format with `<think>` and `<conclusion>` tags) |
-| `vision_binary` | string/null | ✅ | Override vision binary (null = auto-detect) |
+| `vision_binary` | string | ✅ | Override vision binary: "auto" (default, auto-detect), "llama-mtmd-cli", or "llama-qwen2vl-cli" |
 | `backend` | string | ✅ | Same as `llm_mode` |
 | `model_timeout` | int | ✅ | Seconds before unloading inactive model |
 | `llm_timeout` | int | ✅ | Timeout for LLM operations in seconds (10-3600) |
@@ -184,6 +187,98 @@ curl -X POST http://localhost:8000/api/config \
   ]
 }
 ```
+
+---
+
+### GET /api/available-models
+
+Get a list of available models filtered by task type. This endpoint checks which models actually exist in the model folder and returns their availability status.
+
+**Query Parameters:**
+- `task_type` (optional): Filter models by task type. Valid values: `vision`, `chat`, `embedding`
+  - If not specified, returns all models
+
+**Request:**
+```bash
+# Get all available models
+curl http://localhost:8000/api/available-models
+
+# Get only vision models
+curl "http://localhost:8000/api/available-models?task_type=vision"
+
+# Get only chat models
+curl "http://localhost:8000/api/available-models?task_type=chat"
+
+# Get only embedding models
+curl "http://localhost:8000/api/available-models?task_type=embedding"
+```
+
+**Response:** `200 OK`
+```json
+{
+  "models": [
+    {
+      "name": "Gemma 3 4B Vision",
+      "type": "vision",
+      "model_file": "gemma-3-4b-it-Q4_K_M.gguf",
+      "model_exists": true,
+      "mmproj_file": "gemma_3_mmproj-F16.gguf",
+      "mmproj_exists": true,
+      "llm_params": {
+        "temperature": 0.7,
+        "top_p": 0.9
+      }
+    },
+    {
+      "name": "Qwen3 8B Chat",
+      "type": "chat",
+      "model_file": "Qwen3-8B-Q4_K_M.gguf",
+      "model_exists": true,
+      "mmproj_file": null,
+      "mmproj_exists": null,
+      "llm_params": null
+    },
+    {
+      "name": "Qwen3 Embedding 8B",
+      "type": "embedding",
+      "model_file": "qwen3-embedding-8b-q4_k_m.gguf",
+      "model_exists": true,
+      "mmproj_file": null,
+      "mmproj_exists": null,
+      "llm_params": null
+    }
+  ],
+  "total_count": 3,
+  "task_type": null
+}
+```
+
+**Response Fields:**
+- `models`: Array of model information objects
+  - `name`: Human-readable model name/identifier
+  - `type`: Task type (`vision`, `chat`, or `embedding`)
+  - `model_file`: Model filename
+  - `model_exists`: Boolean indicating if the model file exists in the model folder
+  - `mmproj_file`: Path to multimodal projector file (null if not applicable)
+  - `mmproj_exists`: Boolean indicating if the mmproj file exists (null if not applicable)
+  - `llm_params`: Optional model-specific LLM parameters (null if not defined)
+- `total_count`: Total number of models returned
+- `task_type`: The task type filter applied (null if no filter)
+
+**Error Responses:**
+
+`400 Bad Request` - Invalid task type:
+```json
+{
+  "detail": "Invalid task_type 'invalid_type'. Must be one of: vision, chat, embedding"
+}
+```
+
+**Use Cases:**
+- Check which models are currently available before making requests
+- Display available models to users in a UI
+- Validate configuration before starting long-running tasks
+- Debug model file installation issues
 
 ---
 
@@ -1268,7 +1363,6 @@ The server automatically uses the models configured in `/api/config`:
 | `message` | string | ✅ | The current user message to process |
 | `history` | array | ❌ | Optional chat history in OpenAI format. If provided, the server uses this history instead of its internal conversation state. Each item must have `role` ("user" or "assistant") and `content` fields |
 | `image_name` | string | ❌ | Optional image filename for visual conversations (when `enable_visual_chat` is true). If provided with `enable_visual_chat: true`, the vision model is used instead of the chat model |
-| `image_name` | string | ❌ | Optional image filename for visual conversations (when `enable_visual_chat` is true) |
 
 **Note:** 
 - **One message per connection**: Each WebSocket connection handles exactly one request-response cycle and then closes automatically

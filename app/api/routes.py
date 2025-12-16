@@ -11,7 +11,7 @@ import signal
 from typing import Optional
 from datetime import datetime
 
-from app.config import get_config, update_config, set_storage_metadata_path
+from app.config import get_config, update_config, set_storage_metadata_path, get_available_models
 from app.models import (
     ConfigUpdateRequest,
     ConfigResponse,
@@ -22,7 +22,10 @@ from app.models import (
     ChatRequest,
     WebSocketMessage,
     MetadataStore,
-    FileMetadata
+    FileMetadata,
+    AvailableModelsRequest,
+    ModelInfo,
+    AvailableModelsResponse
 )
 from app.services import (
     get_llm_service,
@@ -105,6 +108,44 @@ async def update_configuration(request: ConfigUpdateRequest):
         llm_params=config.llm_params.model_dump(),
         rag_directory_name=config.rag_directory_name,
         storage_metadata_path=config.storage_metadata_path
+    )
+
+
+@router.get("/available-models", response_model=AvailableModelsResponse)
+async def get_models(task_type: Optional[str] = None):
+    """
+    Get available models filtered by task type.
+    
+    Args:
+        task_type: Optional query parameter to filter by 'vision', 'chat', or 'embedding'.
+                   If not provided, returns all models.
+    
+    Returns:
+        List of available models with existence status for model files.
+    
+    Example:
+        GET /api/available-models
+        GET /api/available-models?task_type=vision
+        GET /api/available-models?task_type=chat
+        GET /api/available-models?task_type=embedding
+    """
+    # Validate task_type if provided
+    if task_type and task_type not in ["vision", "chat", "embedding"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid task_type '{task_type}'. Must be one of: vision, chat, embedding"
+        )
+    
+    # Get available models
+    models_data = get_available_models(task_type)
+    
+    # Convert to ModelInfo objects
+    models = [ModelInfo(**model_data) for model_data in models_data]
+    
+    return AvailableModelsResponse(
+        models=models,
+        total_count=len(models),
+        task_type=task_type
     )
 
 

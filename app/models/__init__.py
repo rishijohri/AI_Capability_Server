@@ -7,12 +7,15 @@ from app.models.requests import (
     TagRequest,
     DescribeRequest,
     ChatMessage,
-    ChatRequest
+    ChatRequest,
+    AvailableModelsRequest
 )
 from .responses import (
     ConfigResponse,
     StatusResponse,
-    WebSocketMessage
+    WebSocketMessage,
+    ModelInfo,
+    AvailableModelsResponse
 )
 
 __all__ = [
@@ -24,7 +27,10 @@ __all__ = [
     "DescribeRequest",
     "ChatMessage",
     "ChatRequest",
+    "AvailableModelsRequest",
     "ConfigResponse",
     "StatusResponse",
-    "WebSocketMessage"
+    "WebSocketMessage",
+    "ModelInfo",
+    "AvailableModelsResponse"
 ]

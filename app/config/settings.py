@@ -468,3 +468,48 @@ def set_storage_metadata_path(path: str) -> None:
     """Set the storage metadata path (internal use only)."""
     global _config
     _config.storage_metadata_path = path
+
+
+def get_available_models(task_type: Optional[str] = None) -> list[dict]:
+    """
+    Get list of available models filtered by task type.
+    
+    Args:
+        task_type: Optional filter by 'vision', 'chat', or 'embedding'.
+                   If None, returns all models.
+    
+    Returns:
+        List of model information dictionaries with availability status.
+    """
+    config = get_config()
+    available = []
+    
+    for model_id, model_info in model_options.items():
+        # Filter by task type if specified
+        if task_type and model_info.get("type") != task_type:
+            continue
+        
+        # Check if model file exists
+        model_file = model_info.get("model_file")
+        model_path = config.get_model_path(model_file) if model_file else None
+        model_exists = model_path.exists() if model_path else False
+        
+        # For vision models, check mmproj file
+        mmproj_file = model_info.get("mmproj_file")
+        mmproj_exists = None
+        if mmproj_file:
+            mmproj_path = config.get_model_path(mmproj_file)
+            mmproj_exists = mmproj_path.exists()
+        
+        # Build model info
+        available.append({
+            "name": model_info.get("name", model_id),
+            "type": model_info.get("type"),
+            "model_file": model_file,
+            "model_exists": model_exists,
+            "mmproj_file": mmproj_file,
+            "mmproj_exists": mmproj_exists,
+            "llm_params": model_info.get("llm_params")
+        })
+    
+    return available

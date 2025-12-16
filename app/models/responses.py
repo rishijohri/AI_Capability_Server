@@ -45,3 +45,21 @@ class WebSocketMessage(BaseModel):
     def to_json(self) -> Dict[str, Any]:
         """Convert to JSON dict."""
         return self.model_dump()
+
+
+class ModelInfo(BaseModel):
+    """Information about an available model."""
+    name: str = Field(..., description="Model identifier")
+    type: Literal["vision", "chat", "embedding"] = Field(..., description="Model task type")
+    model_file: str = Field(..., description="Model filename")
+    model_exists: bool = Field(..., description="Whether model file exists in model directory")
+    mmproj_file: Optional[str] = Field(None, description="MMProj file for vision models")
+    mmproj_exists: Optional[bool] = Field(None, description="Whether MMProj file exists (for vision models)")
+    llm_params: Optional[Dict[str, Any]] = Field(None, description="Model-specific LLM parameters")
+
+
+class AvailableModelsResponse(BaseModel):
+    """Response with available models."""
+    models: list[ModelInfo] = Field(..., description="List of available models")
+    total_count: int = Field(..., description="Total number of models matching criteria")
+    task_type: Optional[str] = Field(None, description="Filtered task type, if any")
