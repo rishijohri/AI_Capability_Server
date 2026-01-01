@@ -313,7 +313,7 @@ class LlamaCLIBackend(LLMBackend):
         config = get_config()
         self._vision_binary_path = config.get_binary_path("llama-mtmd-cli")
         self._binary_path = config.get_binary_path("llama-cli")
-        self._embed_binary_path = config.get_binary_path("llama-embedding")
+        self._embed_binary_path = config.get_binary_path("llama-embedding")  # Use llama-cli for embeddings
         if not self._binary_path.exists():
             raise FileNotFoundError(f"llama-cli binary not found: {self._binary_path}")
         
@@ -450,11 +450,12 @@ class LlamaCLIBackend(LLMBackend):
         # Ensure embed binary path is available (start() normally sets this)
         config = get_config()
         if not self._embed_binary_path:
-            self._embed_binary_path = config.get_binary_path("llama-embedding")
+            self._embed_binary_path = config.get_binary_path("llama-cli")  # Use llama-cli for embeddings
 
         command = [
             str(self._embed_binary_path),
             "--model", str(self.model_path),
+            # "--embedding",  # Add embedding flag
             "--prompt", text
         ]
         

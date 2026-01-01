@@ -10,6 +10,7 @@ import uvicorn
 from app.api import router
 from app.utils import get_process_manager
 from app.services import get_llm_service
+from app.config import initialize_config
 
 
 @asynccontextmanager
@@ -17,6 +18,17 @@ async def lifespan(app: FastAPI):
     """Manage application lifecycle."""
     # Startup
     print("AI Server starting...")
+    
+    # Initialize configuration and detect system
+    config = initialize_config()
+    print(f"System detected: {config.system_info.get('os', 'unknown')} "
+          f"({config.system_info.get('architecture', 'unknown')}, "
+          f"{config.system_info.get('gpu', 'cpu')})")
+    print(f"Selected binary configuration: {config.binary_config}")
+    
+    available_configs = config.get_available_binary_configs()
+    if available_configs:
+        print(f"Available binary configurations: {', '.join(available_configs)}")
     
     yield
     

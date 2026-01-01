@@ -104,7 +104,10 @@ async def get_configuration():
         llm_timeout=config.llm_timeout,
         llm_params=config.llm_params.model_dump(),
         rag_directory_name=config.rag_directory_name,
-        storage_metadata_path=config.storage_metadata_path
+        storage_metadata_path=config.storage_metadata_path,
+        binary_config=config.binary_config,
+        system_info=config.system_info,
+        available_binary_configs=config.get_available_binary_configs()
     )
 
 
@@ -135,7 +138,10 @@ async def update_configuration(request: ConfigUpdateRequest):
         llm_timeout=config.llm_timeout,
         llm_params=config.llm_params.model_dump(),
         rag_directory_name=config.rag_directory_name,
-        storage_metadata_path=config.storage_metadata_path
+        storage_metadata_path=config.storage_metadata_path,
+        binary_config=config.binary_config,
+        system_info=config.system_info,
+        available_binary_configs=config.get_available_binary_configs()
     )
 
 

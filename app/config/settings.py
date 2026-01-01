@@ -6,7 +6,8 @@ import os
 from pathlib import Path
 from app.utils.resource_paths import get_binary_path as get_binary_resource_path
 from app.utils.resource_paths import get_model_path as get_model_resource_path
-from app.utils.resource_paths import get_data_directory
+from app.utils.resource_paths import get_data_directory, get_base_path
+from app.utils.system_detector import SystemDetector
 
 
 class LLMParams(BaseModel):
@@ -364,6 +365,16 @@ Remember: Both sections are required.""",
         description="Directory containing InsightFace models (None = use bundled model/ directory)"
     )
     
+    # Binary configuration (automatically detected or manually set)
+    binary_config: str = Field(
+        default="",
+        description="Selected binary configuration folder (e.g., 'llama-mac-arm64', 'llama-win-vulkan-x64'). Empty string triggers auto-detection."
+    )
+    system_info: dict = Field(
+        default_factory=dict,
+        description="Detected system information (OS, architecture, GPU)"
+    )
+    
     # Vision binary preference
     vision_binary: Literal["auto", "llama-mtmd-cli", "llama-qwen2vl-cli"] = Field(
         default="auto",
@@ -406,12 +417,56 @@ Remember: Both sections are required.""",
         metadata_path = Path(self.storage_metadata_path)
         return metadata_path.parent / self.rag_directory_name
     
+    def _auto_detect_binary_config(self) -> None:
+        """Auto-detect and set binary configuration."""
+        base_path = get_base_path()
+        binary_dir_path = base_path / self.binary_dir
+        self.binary_config = SystemDetector.auto_detect_config(binary_dir_path)
+        self.system_info = SystemDetector.get_system_info()
+    
+    def get_available_binary_configs(self) -> list[str]:
+        """Get list of available binary configurations."""
+        base_path = get_base_path()
+        binary_dir_path = base_path / self.binary_dir
+        return SystemDetector.get_available_configs(binary_dir_path)
+    
+    def set_binary_config(self, config_name: str) -> bool:
+        """
+        Set binary configuration manually.
+        
+        Args:
+            config_name: Configuration folder name (e.g., 'llama-mac-arm64')
+            
+        Returns:
+            True if configuration is valid, False otherwise
+        """
+        base_path = get_base_path()
+        binary_dir_path = base_path / self.binary_dir
+        
+        if SystemDetector.validate_config(config_name, binary_dir_path):
+            self.binary_config = config_name
+            return True
+        return False
+    
     def get_binary_path(self, binary_name: str) -> Path:
         """Get absolute path to a specific binary.
         
-        Uses PyInstaller-compatible resource path resolution.
+        Uses PyInstaller-compatible resource path resolution and selected binary configuration.
         """
-        return get_binary_resource_path(binary_name)
+        # If binary_config is set, use it; otherwise auto-detect
+        if not self.binary_config:
+            self._auto_detect_binary_config()
+        
+        # Get base path and construct path to binary in selected config folder
+        base_path = get_base_path()
+        binary_path = base_path / self.binary_dir / "llama_binaries" / self.binary_config / binary_name
+        
+        # Add .exe extension on Windows if not present
+        import platform
+        if platform.system() == "Windows" and not binary_name.endswith(".exe"):
+            binary_path = binary_path.with_suffix(".exe")
+        
+        return binary_path
     
     def get_model_path(self, model_name: str) -> Path:
         """Get absolute path to a specific model.
@@ -437,6 +492,14 @@ Remember: Both sections are required.""",
 _config = ServerConfig()
 
 
+def initialize_config() -> ServerConfig:
+    """Initialize configuration with auto-detected binary config."""
+    global _config
+    if not _config.binary_config:
+        _config._auto_detect_binary_config()
+    return _config
+
+
 def get_config() -> ServerConfig:
     """Get the global configuration instance."""
     return _config
@@ -447,8 +510,14 @@ def update_config(**kwargs) -> ServerConfig:
     global _config
     
     # Filter out read-only fields
-    read_only_fields = {"rag_directory_name", "storage_metadata_path", "binary_dir", "model_dir"}
+    read_only_fields = {"rag_directory_name", "storage_metadata_path", "binary_dir", "model_dir", "system_info"}
     editable_kwargs = {k: v for k, v in kwargs.items() if k not in read_only_fields}
+    
+    # Handle binary_config validation
+    if "binary_config" in editable_kwargs:
+        config_name = editable_kwargs["binary_config"]
+        if config_name and not _config.set_binary_config(config_name):
+            raise ValueError(f"Invalid binary configuration: {config_name}")
     
     # Handle nested llm_params update
     if "llm_params" in editable_kwargs:

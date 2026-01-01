@@ -27,6 +27,9 @@ class ConfigResponse(BaseModel):
     llm_params: Dict[str, Any]
     rag_directory_name: str
     storage_metadata_path: Optional[str]
+    binary_config: str = Field(..., description="Selected binary configuration folder")
+    system_info: Dict[str, str] = Field(..., description="Detected system information")
+    available_binary_configs: list[str] = Field(..., description="List of available binary configurations")
 
 
 class StatusResponse(BaseModel):
