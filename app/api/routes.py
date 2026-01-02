@@ -72,6 +72,19 @@ def build_rag_context_from_results(relevant_files: list[FileMetadata]) -> tuple[
         context_parts.append(f"  Tags: {', '.join(file_meta.tags)}")
         if file_meta.description:
             context_parts.append(f"  Description: {file_meta.description}")
+        
+        # Include any extra/unknown metadata fields (Pydantic v2 stores in __pydantic_extra__)
+        if hasattr(file_meta, '__pydantic_extra__') and file_meta.__pydantic_extra__:
+            for field_name, field_value in file_meta.__pydantic_extra__.items():
+                if field_value is not None:
+                    if isinstance(field_value, list):
+                        context_parts.append(f"  {field_name}: {', '.join(str(v) for v in field_value)}")
+                    elif isinstance(field_value, dict):
+                        import json
+                        context_parts.append(f"  {field_name}: {json.dumps(field_value)}")
+                    else:
+                        context_parts.append(f"  {field_name}: {field_value}")
+        
         context_parts.append("")
         file_list.append(file_meta.fileName)
     
@@ -212,6 +225,9 @@ async def set_storage_metadata(request: StorageMetadataRequest):
         embedding_service = get_embedding_service()
         embeddings_loaded = embedding_service.load_embeddings()
         
+        # Get identified metadata properties
+        identified_properties = _metadata_store.get_identified_properties()
+        
         return StatusResponse(
             status="success",
             message=f"Storage metadata set to {path}",
@@ -219,7 +235,8 @@ async def set_storage_metadata(request: StorageMetadataRequest):
                 "metadata_count": len(_metadata_store.get_all_metadata()),
                 "rag_directory": str(rag_dir) if rag_dir else None,
                 "embeddings_loaded": embeddings_loaded,
-                "embeddings_count": len(embedding_service.get_all_embeddings()) if embeddings_loaded else 0
+                "embeddings_count": len(embedding_service.get_all_embeddings()) if embeddings_loaded else 0,
+                "identified_properties": identified_properties
             }
         )
     except Exception as e:

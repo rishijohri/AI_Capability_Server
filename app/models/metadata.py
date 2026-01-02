@@ -26,7 +26,13 @@ import asyncio
 
 
 class FileMetadata(BaseModel):
-    """Metadata for a single file."""
+    """Metadata for a single file.
+    
+    This model accepts extra fields that may be present in the storage_metadata.json
+    file, ensuring forward compatibility with new metadata properties.
+    """
+    model_config = {"extra": "allow"}  # Allow extra fields
+    
     fileName: str
     deviceId: str
     deviceName: str
@@ -48,7 +54,11 @@ class FileMetadata(BaseModel):
         return datetime.fromisoformat(self.uploadTime.replace('Z', '+00:00'))
     
     def to_text_representation(self) -> str:
-        """Convert metadata to text for embedding generation."""
+        """Convert metadata to text for embedding generation.
+        
+        Includes all metadata fields, including extra/unknown fields.
+        """
+        # Start with standard fields
         parts = [
             f"File: {self.fileName}",
             f"Type: {self.type}",
@@ -56,6 +66,19 @@ class FileMetadata(BaseModel):
             f"Tags: {', '.join(self.tags)}" if self.tags else "",
             f"Description: {self.description}" if self.description else ""
         ]
+        
+        # Add any extra fields stored in model_extra (Pydantic v2)
+        if hasattr(self, '__pydantic_extra__') and self.__pydantic_extra__:
+            for field_name, field_value in self.__pydantic_extra__.items():
+                if field_value is not None:
+                    # Format extra fields for text representation
+                    if isinstance(field_value, list):
+                        parts.append(f"{field_name}: {', '.join(str(v) for v in field_value)}")
+                    elif isinstance(field_value, dict):
+                        parts.append(f"{field_name}: {json.dumps(field_value)}")
+                    else:
+                        parts.append(f"{field_name}: {field_value}")
+        
         return "\n".join(p for p in parts if p)
 
 
@@ -68,10 +91,11 @@ class MetadataStore:
         self.metadata: List[FileMetadata] = []
         self._last_modified_time: Optional[float] = None
         self._reload_lock = asyncio.Lock()
+        self.identified_properties: Dict[str, str] = {}  # Track property types
         self._load_metadata()
     
     def _load_metadata(self) -> None:
-        """Load metadata from file."""
+        """Load metadata from file and identify all properties."""
         if not self.metadata_path.exists():
             raise FileNotFoundError(f"Metadata file not found: {self.metadata_path}")
         
@@ -81,6 +105,9 @@ class MetadataStore:
         with open(self.metadata_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
             self.metadata = [FileMetadata(**item) for item in data]
+            
+            # Analyze all properties across all entries
+            self._identify_properties(data)
     
     def save_metadata(self) -> None:
         """Save metadata to file (disabled - read-only mode)."""
@@ -134,3 +161,35 @@ class MetadataStore:
     def reload(self) -> None:
         """Reload metadata from file."""
         self._load_metadata()
+    
+    def _identify_properties(self, data: List[Dict[str, Any]]) -> None:
+        """Identify all properties and their types from metadata entries."""
+        self.identified_properties = {}
+        
+        for entry in data:
+            for key, value in entry.items():
+                if key not in self.identified_properties:
+                    # Determine type
+                    if value is None:
+                        self.identified_properties[key] = "null"
+                    elif isinstance(value, bool):
+                        self.identified_properties[key] = "boolean"
+                    elif isinstance(value, int):
+                        self.identified_properties[key] = "integer"
+                    elif isinstance(value, float):
+                        self.identified_properties[key] = "number"
+                    elif isinstance(value, str):
+                        self.identified_properties[key] = "string"
+                    elif isinstance(value, list):
+                        if value and isinstance(value[0], str):
+                            self.identified_properties[key] = "array[string]"
+                        else:
+                            self.identified_properties[key] = "array"
+                    elif isinstance(value, dict):
+                        self.identified_properties[key] = "object"
+                    else:
+                        self.identified_properties[key] = "unknown"
+    
+    def get_identified_properties(self) -> Dict[str, str]:
+        """Get dictionary of identified property names and their types."""
+        return self.identified_properties.copy()
