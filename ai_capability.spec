@@ -20,16 +20,31 @@ from pathlib import Path
 # Get project root
 project_root = Path(SPECPATH)
 
-# Collect all binary files
+# Collect all binary files including llama_binaries subdirectories
 binaries = []
+datas = []  # Initialize datas here for binary directory structure
 binary_dir = project_root / 'binary'
+
 if binary_dir.exists():
+    # First, collect any binaries in the root binary/ directory (legacy support)
     for binary_file in binary_dir.iterdir():
         if binary_file.is_file():
             binaries.append((str(binary_file), 'binary'))
+    
+    # Then, collect binaries from llama_binaries subdirectories (new structure)
+    llama_binaries_dir = binary_dir / 'llama_binaries'
+    if llama_binaries_dir.exists():
+        for config_dir in llama_binaries_dir.iterdir():
+            if config_dir.is_dir():
+                # Collect all files in each configuration directory
+                for binary_file in config_dir.iterdir():
+                    if binary_file.is_file():
+                        # Preserve directory structure: binary/llama_binaries/[config]/[binary]
+                        rel_path = binary_file.relative_to(binary_dir)
+                        dest_dir = 'binary' / rel_path.parent
+                        datas.append((str(binary_file), str(dest_dir)))
 
-# Collect all model files
-datas = []
+# Collect all model files (datas already initialized above)
 model_dir = project_root / 'model'
 if model_dir.exists():
     # Add GGUF model files
