@@ -104,13 +104,20 @@ class RAGService:
         self,
         metadata_store: MetadataStore,
         progress_callback=None
-    ) -> None:
+    ) -> Dict[str, Any]:
         """
         Build RAG database from embeddings.
         
         Args:
             metadata_store: Metadata store
             progress_callback: Optional callback for progress updates
+            
+        Returns:
+            Dictionary containing:
+                - success: bool
+                - mismatched_files: List of filenames with mismatched embedding dimensions
+                - majority_dimension: The dimension used for the RAG
+                - removed_count: Number of files removed due to mismatch
         """
         config = get_config()
         embedding_service = get_embedding_service()
@@ -120,8 +127,50 @@ class RAGService:
         if not embeddings:
             raise ValueError("No embeddings available. Generate embeddings first.")
         
+        # Check for dimension mismatches and find majority dimension
+        dimension_counts = {}
+        file_dimensions = {}
+        
+        for filename, embedding in embeddings.items():
+            dim = len(embedding)
+            file_dimensions[filename] = dim
+            dimension_counts[dim] = dimension_counts.get(dim, 0) + 1
+        
+        # Find majority dimension
+        if len(dimension_counts) > 1:
+            majority_dimension = max(dimension_counts, key=dimension_counts.get)
+            if progress_callback:
+                await progress_callback(
+                    f"Warning: Found embeddings with different dimensions. "
+                    f"Using majority dimension: {majority_dimension} "
+                    f"({dimension_counts[majority_dimension]} files)"
+                )
+        else:
+            majority_dimension = list(dimension_counts.keys())[0]
+        
+        # Filter out mismatched embeddings
+        mismatched_files = []
+        matched_embeddings = {}
+        
+        for filename, embedding in embeddings.items():
+            if file_dimensions[filename] == majority_dimension:
+                matched_embeddings[filename] = embedding
+            else:
+                mismatched_files.append(filename)
+                if progress_callback:
+                    await progress_callback(
+                        f"Removing {filename}: dimension {file_dimensions[filename]} "
+                        f"(expected {majority_dimension})"
+                    )
+        
+        if not matched_embeddings:
+            raise ValueError("No embeddings with matching dimensions found.")
+        
+        # Use matched embeddings for RAG
+        embeddings = matched_embeddings
+        original_dim = majority_dimension
+        
         # Check if we need to reduce dimensions
-        original_dim = len(next(iter(embeddings.values())))
         target_dim = config.reduced_embedding_size
         
         if target_dim and target_dim < original_dim:
@@ -158,8 +207,17 @@ class RAGService:
             
             if progress_callback:
                 await progress_callback(f"RAG database saved to {index_path}")
+        
+        # Return result with mismatched files info
+        return {
+            "success": True,
+            "mismatched_files": mismatched_files,
+            "majority_dimension": majority_dimension,
+            "removed_count": len(mismatched_files),
+            "total_indexed": len(matched_embeddings)
+        }
     
-    def load_rag(self, metadata_store: MetadataStore) -> bool:
+    def load_rag(self, metadata_store: MetadataStore) -> Dict[str, Any]:
         """
         Load RAG database from file.
         
@@ -167,17 +225,20 @@ class RAGService:
             metadata_store: Metadata store
             
         Returns:
-            True if loaded successfully
+            Dictionary containing:
+                - success: bool
+                - dimension: The dimension of loaded RAG
+                - indexed_files: Number of files in the index
         """
         config = get_config()
         rag_dir = config.get_rag_directory()
         
         if not rag_dir or not rag_dir.exists():
-            return False
+            return {"success": False, "error": "RAG directory not found"}
         
         index_path = rag_dir / "faiss_index.bin"
         if not index_path.exists():
-            return False
+            return {"success": False, "error": "RAG index not found"}
         
         try:
             # Determine dimension from config
@@ -200,10 +261,14 @@ class RAGService:
             self.vector_db.load(index_path)
             self.metadata_store = metadata_store
             
-            return True
+            return {
+                "success": True,
+                "dimension": dimension,
+                "indexed_files": len(self.vector_db.id_map)
+            }
         except Exception as e:
             print(f"Error loading RAG database: {e}")
-            return False
+            return {"success": False, "error": str(e)}
     
     async def search(
         self,

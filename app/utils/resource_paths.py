@@ -67,7 +67,13 @@ def get_binary_path(binary_name: str) -> Path:
 
 
 def get_model_path(model_name: str) -> Path:
-    """Get absolute path to a model file.
+    """Get absolute path to a model file in the static model/ directory.
+    
+    Note: This function is for the static model/ directory in the project root.
+    For LLM GGUF models, use config.get_model_path() which uses the dynamic
+    saved_llm/ location based on storage_metadata_path.
+    
+    This function is used as a fallback when storage_metadata_path is not set.
     
     Args:
         model_name: Name of the model file (e.g., "Qwen3-8B-Q4_K_M.gguf")
@@ -97,6 +103,10 @@ def get_data_directory() -> Path:
 
 def get_face_models_path() -> Path:
     """Get absolute path to the face models directory.
+    
+    Face recognition models (buffalo_l) are stored in the static model/ directory
+    (specifically model/models/buffalo_l/). This is separate from LLM GGUF models
+    which are stored in the dynamic saved_llm/ location.
     
     Returns:
         Path: Absolute path to the face models directory (model/)

@@ -50,10 +50,16 @@ See **[WINDOWS_SUPPORT.md](WINDOWS_SUPPORT.md)** for detailed cross-platform inf
 - **[QUICKSTART.md](QUICKSTART.md)** - Quick start guide for immediate usage
 - **[README_AI_SERVER.md](README_AI_SERVER.md)** - Comprehensive documentation
 - **[PROJECT_SUMMARY.md](PROJECT_SUMMARY.md)** - Technical overview and architecture
+- **[MODEL_DOWNLOAD_GUIDE.md](MODEL_DOWNLOAD_GUIDE.md)** - ⭐ Model download feature guide
+- **[HOT_RELOAD_GUIDE.md](HOT_RELOAD_GUIDE.md)** - 🔥 Hot reload & dynamic configuration
+- **[API_REFERENCE.md](API_REFERENCE.md)** - Complete API documentation
 
 ## ✨ Features
 
 - ✅ **Configuration Management** - Flexible REST API configuration
+- ✅ **Hot Reload** - 🔥 Configuration changes without server restart
+- ✅ **Model Download** - Download GGUF models from Hugging Face repositories
+- ✅ **Dynamic Model Paths** - Flexible model directory management
 - ✅ **RAG Database** - FAISS-based vector search with PCA reduction
 - ✅ **Embedding Generation** - LLM-powered embedding creation
 - ✅ **Vision Processing** - Image/video tagging and description

@@ -28,6 +28,7 @@ model_options = {
             "type": "vision",
             "model_file": "Qwen2.5-VL-7B-Instruct-UD-IQ2_M.gguf",
             "mmproj_file": "mmproj-F16.gguf",
+            "repo_id": "unsloth/Qwen2.5-VL-7B-Instruct-GGUF",  # Add Hugging Face repo ID for download
             "llm_params": {
                 "ctx_size": 12192,
                 "n_gpu_layers": 99,
@@ -44,6 +45,7 @@ model_options = {
             "name": "qwen_3",
             "type": "chat",
             "model_file": "Qwen3-8B-Q4_K_M.gguf",
+            "repo_id": "Qwen/Qwen3-8B-GGUF",  # Add Hugging Face repo ID for download
             "llm_params": {
                 "ctx_size": 12192,
                 "n_gpu_layers": 99,
@@ -57,10 +59,11 @@ model_options = {
             }
             
         },
-       "qwen_3_embedding": {
-            "name": "qwen_3_embedding",
+       "qwen_3_8B_embedding": {
+            "name": "qwen_3_8b",
             "type": "embedding",
             "model_file":"qwen3-embedding-8b-q4_k_m.gguf",
+            "repo_id": "Qwen/Qwen3-Embedding-8B-GGUF",  # Add Hugging Face repo ID for download
             "llm_params": {
                 "ctx_size": 12192,
                 "n_gpu_layers": 99,
@@ -73,117 +76,37 @@ model_options = {
                 "ubatch_size": 1024
             }
         },
-       "mini_cpm_4.5_km": {
-            "name": "MiniCPM4.5_KM",
-            "type": "vision",
-            # "model_file": "ggml-model-Q4_0.gguf",
-            "model_file": "ggml-model-Q4_K_M.gguf",
-            "mmproj_file": "mmproj-model-f16-ggml.gguf",
-            "llm_params": {
-                "ctx_size": 12192,
-                "n_gpu_layers": 99,
-                "top_k": 40,
-                "top_p": 0.9,
-                "temp": 0.35,
-                "presence_penalty": 0.2,
-                "microstat": 2,
-                "batch_size": 8192,
-                "ubatch_size": 1024
-            }
-        },
-       "mini_cpm_4.5_ks": {
-            "name": "MiniCPM4.5_KS",
-            "type": "vision",
-            # "model_file": "ggml-model-Q4_0.gguf",
-            "model_file": "MiniCPM4-Q4_K_S.gguf",
-            "mmproj_file": "MiniCPM4_mmproj-model-f16.gguf",
-            "llm_params": {
-                "ctx_size": 12192,
-                "n_gpu_layers": 99,
-                "top_k": 40,
-                "top_p": 0.9,
-                "temp": 0.35,
-                "presence_penalty": 0.2,
-                "microstat": 2,
-                "batch_size": 8192,
-                "ubatch_size": 1024
-            }
-        },
-       "granite4_micro": {
-            "name": "granite4_micro",
-            "type": "chat",
-            "model_file": "granite4-7b-q4k.gguf",
-            "llm_params": {
-                "ctx_size": 12192,
-                "n_gpu_layers": 99,
-                "top_k": 40,
-                "top_p": 0.9,
-                "temp": 0.35,
-                "presence_penalty": 0.2,
-                "microstat": 2,
-                "batch_size": 8192,
-                "ubatch_size": 1024
-            }
-        },
-       "granite4_350m": {
-            "name": "granite4_350m",
-            "type": "chat",
-            "model_file": "granite-4.0-350m-UD-Q6_K_XL.gguf",
-            "llm_params": {
-                "ctx_size": 12192,
-                "n_gpu_layers": 99,
-                "top_k": 40,
-                "top_p": 0.9,
-                "temp": 0.35,
-                "presence_penalty": 0.2,
-                "microstat": 2,
-                "batch_size": 8192,
-                "ubatch_size": 1024
-            }
-        },
-       "llava_phi3_4k": {
-            "name": "llava_phi3_4k",
-            "type": "vision",
-            "model_file": "llava-phi3-mini-Q4_K_M.gguf",
-            "mmproj_file": "llava-phi3-mini-mmproj-f16.gguf",
-            "llm_params": {
-                "ctx_size": 12192,
-                "n_gpu_layers": 99,
-                "top_k": 40,
-                "top_p": 0.9,
-                "temp": 0.35,
-                "presence_penalty": 0.2,
-                "microstat": 2,
-                "batch_size": 8192,
-                "ubatch_size": 1024
-            }
-        },
-       "qwen_3_4B": {
+       "qwen_3_4B_embedding": {
             "name": "qwen_3_4B",
             "type": "embedding",
             "model_file":"Qwen3-Embedding-4B-Q4_K_M.gguf",
+            "repo_id": "Qwen/Qwen3-Embedding-4B-GGUF",  # Add Hugging Face repo ID for download
         },
-       "gemma3_300m": {
+       "gemma3_300m_embedding": {
             "name": "gemma3_300m",
             "type": "embedding",
             "model_file":"embeddinggemma-300M-Q8_0.gguf",
+            "repo_id": "unsloth/embeddinggemma-300m-GGUF",  # Add Hugging Face repo ID for download
         },
        "gemma_3_4b_1Q": {
             "model_file": "gemma-3-4b-it-UD-IQ1_S.gguf",
             "name": "gemma_3_4b_1Q",
             "type": "vision",
-            "mmproj_file": "gemma_3_mmproj-F16.gguf",
+            "mmproj_file": "mmproj-F16.gguf",
+            "repo_id": "unsloth/gemma-3-4b-it-GGUF",  # Add Hugging Face repo ID for download
         },
        "qwen_3_0.6B": {
             "model_file": "Qwen3-0.6B-Q4_K_M.gguf",
             "name": "qwen_3_0.6B",
-            "type": "chat"
+            "type": "chat",
+            "repo_id": "unsloth/Qwen3-0.6B-GGUF",  # Add Hugging Face repo ID for download
         },
        "gemma3_4b_q4_k_m": {
             "name": "gemma3_4b_q4_k_m",
             "type": "vision",
             "model_file": "gemma-3-4b-it-Q4_K_M.gguf",
-            "mmproj_file": "gemma_3_mmproj-F16.gguf",
+            "mmproj_file": "mmproj-F16.gguf",
+            "repo_id": "unsloth/gemma-3-4b-it-GGUF",  # Add Hugging Face repo ID for download
         }
 }
 
@@ -238,10 +161,10 @@ class ServerConfig(BaseModel):
     # Model file names
     chat_model: str = Field(
         default=model_options["qwen_3_0.6B"]["model_file"],
-        description="Chat/conversation model filename"
+        description="Chat/conversation model filename (can be a vision model for multimodal chat)"
     )
     embedding_model: str = Field(
-        default=model_options["qwen_3_4B"]["model_file"],
+        default=model_options["qwen_3_4B_embedding"]["model_file"],
         description="Embedding model filename"
     )
     vision_model: str = Field(
@@ -350,6 +273,10 @@ Remember: Both sections are required.""",
         default=None,
         description="Path to storage-metadata.json file"
     )
+    model_directory: Optional[str] = Field(
+        default=None,
+        description="Custom model directory path. If None, uses saved_llm/ alongside storage_metadata.json"
+    )
     
     # Binary and model paths (relative to project root)
     binary_dir: str = Field(
@@ -417,6 +344,22 @@ Remember: Both sections are required.""",
         metadata_path = Path(self.storage_metadata_path)
         return metadata_path.parent / self.rag_directory_name
     
+    def get_saved_llm_directory(self) -> Optional[Path]:
+        """Get full path to saved_llm directory where LLM models (GGUF files) are stored.
+        
+        This is only for LLM models. Face recognition models remain in model/models/.
+        
+        Returns:
+            Path to saved_llm directory if storage_metadata_path is set, None otherwise.
+            The directory is created if it doesn't exist.
+        """
+        if not self.storage_metadata_path:
+            return None
+        metadata_path = Path(self.storage_metadata_path)
+        saved_llm_dir = metadata_path.parent / "saved_llm"
+        saved_llm_dir.mkdir(parents=True, exist_ok=True)
+        return saved_llm_dir
+    
     def _auto_detect_binary_config(self) -> None:
         """Auto-detect and set binary configuration."""
         base_path = get_base_path()
@@ -469,11 +412,41 @@ Remember: Both sections are required.""",
         return binary_path
     
     def get_model_path(self, model_name: str) -> Path:
-        """Get absolute path to a specific model.
+        """Get absolute path to a specific LLM model (GGUF files).
         
-        Uses PyInstaller-compatible resource path resolution.
+        Priority order:
+        1. Custom model_directory (if configured via API)
+        2. saved_llm folder in the same directory as storage_metadata.json
+        3. Default model/ directory (fallback)
+        
+        Note: This is ONLY for LLM GGUF models. Face recognition models (buffalo_l)
+              remain in the static model/models/ directory.
+        
+        Args:
+            model_name: Name of the model file (can be empty string to get directory path)
+        
+        Returns:
+            Path: Absolute path to the model file or model directory
         """
-        return get_model_resource_path(model_name)
+        # Use custom model directory if configured
+        if self.model_directory:
+            model_dir = Path(self.model_directory)
+            model_dir.mkdir(parents=True, exist_ok=True)
+            return model_dir / model_name if model_name else model_dir
+        
+        # Use saved_llm folder if storage_metadata_path is set
+        if self.storage_metadata_path:
+            metadata_path = Path(self.storage_metadata_path)
+            saved_llm_dir = metadata_path.parent / "saved_llm"
+            
+            # Create saved_llm directory if it doesn't exist
+            saved_llm_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Return the model path
+            return saved_llm_dir / model_name if model_name else saved_llm_dir
+        else:
+            # Fall back to default model directory
+            return get_model_resource_path(model_name)
     
     def get_vision_binary(self, model_name: str) -> str:
         """Determine which vision binary to use based on model name."""
@@ -546,6 +519,7 @@ def get_available_models(task_type: Optional[str] = None) -> list[dict]:
     Args:
         task_type: Optional filter by 'vision', 'chat', or 'embedding'.
                    If None, returns all models.
+                   Note: 'chat' includes both chat and vision models (vision models can be used for chat).
     
     Returns:
         List of model information dictionaries with availability status.
@@ -554,9 +528,17 @@ def get_available_models(task_type: Optional[str] = None) -> list[dict]:
     available = []
     
     for model_id, model_info in model_options.items():
+        model_type = model_info.get("type")
+        
         # Filter by task type if specified
-        if task_type and model_info.get("type") != task_type:
-            continue
+        # Vision models can also be used as chat models
+        if task_type:
+            if task_type == "chat":
+                # Include both chat and vision models for chat requests
+                if model_type not in ["chat", "vision"]:
+                    continue
+            elif model_type != task_type:
+                continue
         
         # Check if model file exists
         model_file = model_info.get("model_file")

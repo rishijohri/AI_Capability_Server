@@ -23,6 +23,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 import asyncio
+import os
 
 
 class FileMetadata(BaseModel):
@@ -38,7 +39,7 @@ class FileMetadata(BaseModel):
     deviceName: str
     uploadTime: str
     tags: List[str] = Field(default_factory=list)
-    aspectRatio: float
+    aspectRatio: Optional[float] = None
     type: str  # "video" or "image"
     aiModel: Optional[str] = None
     creationTime: str
@@ -85,13 +86,19 @@ class FileMetadata(BaseModel):
 class MetadataStore:
     """Store for managing file metadata."""
     
-    def __init__(self, metadata_path: str):
-        """Initialize metadata store."""
+    def __init__(self, metadata_path: str, auto_prompt_permission: bool = True):
+        """Initialize metadata store.
+        
+        Args:
+            metadata_path: Path to storage_metadata.json
+            auto_prompt_permission: If True, automatically prompt for permission on access errors
+        """
         self.metadata_path = Path(metadata_path)
         self.metadata: List[FileMetadata] = []
         self._last_modified_time: Optional[float] = None
         self._reload_lock = asyncio.Lock()
         self.identified_properties: Dict[str, str] = {}  # Track property types
+        self.auto_prompt_permission = auto_prompt_permission
         self._load_metadata()
     
     def _load_metadata(self) -> None:
@@ -99,15 +106,46 @@ class MetadataStore:
         if not self.metadata_path.exists():
             raise FileNotFoundError(f"Metadata file not found: {self.metadata_path}")
         
-        # Track file modification time
-        self._last_modified_time = self.metadata_path.stat().st_mtime
-        
-        with open(self.metadata_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            self.metadata = [FileMetadata(**item) for item in data]
+        try:
+            # Track file modification time
+            self._last_modified_time = self.metadata_path.stat().st_mtime
             
-            # Analyze all properties across all entries
-            self._identify_properties(data)
+            with open(self.metadata_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                self.metadata = [FileMetadata(**item) for item in data]
+                
+                # Analyze all properties across all entries
+                self._identify_properties(data)
+        except (PermissionError, OSError) as e:
+            # Check if it's a permission error
+            if isinstance(e, PermissionError) or (isinstance(e, OSError) and e.errno in [1, 13]):
+                # Try to use the file picker as fallback if enabled
+                if self.auto_prompt_permission:
+                    try:
+                        from app.utils.file_picker import handle_permission_error_with_picker
+                        selected_dir = handle_permission_error_with_picker(
+                            e,
+                            operation_name="storage folder",
+                            require_metadata=True
+                        )
+                        # Update metadata path to the one in the selected directory
+                        self.metadata_path = Path(selected_dir) / "storage_metadata.json"
+                        # Retry loading
+                        self._last_modified_time = self.metadata_path.stat().st_mtime
+                        with open(self.metadata_path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                            self.metadata = [FileMetadata(**item) for item in data]
+                            self._identify_properties(data)
+                    except ImportError:
+                        # File picker not available, re-raise original error
+                        raise e
+                    except Exception:
+                        # Permission prompt failed, re-raise original error
+                        raise e
+                else:
+                    raise e
+            else:
+                raise e
     
     def save_metadata(self) -> None:
         """Save metadata to file (disabled - read-only mode)."""

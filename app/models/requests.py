@@ -26,6 +26,7 @@ class ConfigUpdateRequest(BaseModel):
     llm_timeout: Optional[int] = Field(None, ge=10, le=3600, description="Timeout for LLM operations in seconds")
     llm_params: Optional[Dict[str, Any]] = None
     binary_config: Optional[str] = Field(None, description="Binary configuration folder name (e.g., 'llama-mac-arm64', 'llama-win-vulkan-x64')")
+    model_directory: Optional[str] = Field(None, description="Custom model directory path (absolute path)")
 
 
 class StorageMetadataRequest(BaseModel):
@@ -63,4 +64,20 @@ class AvailableModelsRequest(BaseModel):
     task_type: Optional[Literal["vision", "chat", "embedding"]] = Field(
         None, 
         description="Filter by task type (vision, chat, embedding). If None, returns all available models."
+    )
+
+
+class DownloadModelsRequest(BaseModel):
+    """Request to download models from Hugging Face."""
+    model_ids: List[str] = Field(
+        ..., 
+        description="List of model IDs from model_options to download (e.g., ['qwen_3', 'gemma3_4b_q4_k_m'])"
+    )
+    force_redownload: bool = Field(
+        False, 
+        description="Force re-download even if model already exists"
+    )
+    download_location: Optional[str] = Field(
+        None,
+        description="Custom download location (absolute path). If None, uses configured model_directory or default saved_llm location"
     )

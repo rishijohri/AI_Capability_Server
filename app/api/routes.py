@@ -25,7 +25,14 @@ from app.models import (
     FileMetadata,
     AvailableModelsRequest,
     ModelInfo,
-    AvailableModelsResponse
+    AvailableModelsResponse,
+    ModelOption,
+    ModelOptionsResponse
+)
+from app.utils.file_picker import (
+    open_directory_picker,
+    is_permission_error,
+    handle_permission_error_with_picker
 )
 from app.services import (
     get_llm_service,
@@ -118,6 +125,7 @@ async def get_configuration():
         llm_params=config.llm_params.model_dump(),
         rag_directory_name=config.rag_directory_name,
         storage_metadata_path=config.storage_metadata_path,
+        model_directory=config.model_directory,
         binary_config=config.binary_config,
         system_info=config.system_info,
         available_binary_configs=config.get_available_binary_configs()
@@ -152,6 +160,7 @@ async def update_configuration(request: ConfigUpdateRequest):
         llm_params=config.llm_params.model_dump(),
         rag_directory_name=config.rag_directory_name,
         storage_metadata_path=config.storage_metadata_path,
+        model_directory=config.model_directory,
         binary_config=config.binary_config,
         system_info=config.system_info,
         available_binary_configs=config.get_available_binary_configs()
@@ -166,6 +175,8 @@ async def get_models(task_type: Optional[str] = None):
     Args:
         task_type: Optional query parameter to filter by 'vision', 'chat', or 'embedding'.
                    If not provided, returns all models.
+                   Note: task_type='chat' returns both chat and vision models since
+                   vision models can also be used for chat conversations.
     
     Returns:
         List of available models with existence status for model files.
@@ -173,7 +184,7 @@ async def get_models(task_type: Optional[str] = None):
     Example:
         GET /api/available-models
         GET /api/available-models?task_type=vision
-        GET /api/available-models?task_type=chat
+        GET /api/available-models?task_type=chat  (includes vision models)
         GET /api/available-models?task_type=embedding
     """
     # Validate task_type if provided
@@ -196,6 +207,338 @@ async def get_models(task_type: Optional[str] = None):
     )
 
 
+@router.get("/model-options", response_model=ModelOptionsResponse)
+async def get_model_options(task_type: Optional[str] = None):
+    """
+    Get all models that can be downloaded, regardless of whether they exist locally.
+    
+    This endpoint returns all models defined in model_options, showing which ones
+    have repo_id configured and are ready for download via /api/download-models.
+    
+    Args:
+        task_type: Optional query parameter to filter by 'vision', 'chat', or 'embedding'.
+                   If not provided, returns all models.
+                   Note: task_type='chat' returns both chat and vision models since
+                   vision models can also be used for chat conversations.
+    
+    Returns:
+        List of all models with download configuration status.
+    
+    Example:
+        GET /api/model-options
+        GET /api/model-options?task_type=vision
+        GET /api/model-options?task_type=chat  (includes vision models)
+    """
+    # Validate task_type if provided
+    if task_type and task_type not in ["vision", "chat", "embedding"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid task_type '{task_type}'. Must be one of: vision, chat, embedding"
+        )
+    
+    # Get model_options from settings
+    from app.config.settings import model_options
+    
+    # Build list of ModelOption objects
+    models = []
+    configured_count = 0
+    
+    for model_id, model_info in model_options.items():
+        model_type = model_info.get("type", "chat")
+        
+        # Filter by task_type if specified
+        # Vision models can also be used as chat models
+        if task_type:
+            if task_type == "chat":
+                # Include both chat and vision models for chat requests
+                if model_type not in ["chat", "vision"]:
+                    continue
+            elif model_type != task_type:
+                continue
+        
+        repo_id = model_info.get("repo_id", "")
+        repo_id_configured = bool(repo_id and repo_id.strip())
+        
+        if repo_id_configured:
+            configured_count += 1
+        
+        model_option = ModelOption(
+            model_id=model_id,
+            name=model_info.get("name", model_id),
+            type=model_info.get("type", "chat"),
+            model_file=model_info.get("model_file", ""),
+            mmproj_file=model_info.get("mmproj_file"),
+            repo_id=repo_id,
+            repo_id_configured=repo_id_configured,
+            llm_params=model_info.get("llm_params")
+        )
+        models.append(model_option)
+    
+    return ModelOptionsResponse(
+        models=models,
+        total_count=len(models),
+        configured_count=configured_count,
+        task_type=task_type
+    )
+
+
+@router.websocket("/download-models")
+async def download_models_ws(websocket: WebSocket):
+    """Download models from Hugging Face repositories (WebSocket)."""
+    await websocket.accept()
+    
+    try:
+        # Receive download request
+        data = await websocket.receive_json()
+        
+        # Import DownloadModelsRequest and response models
+        from app.models import DownloadModelsRequest, DownloadModelsResponse, DownloadStatus
+        
+        # Validate request
+        try:
+            request = DownloadModelsRequest(**data)
+        except Exception as e:
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="error",
+                    message=f"Invalid request: {str(e)}"
+                ).to_json()
+            )
+            return
+        
+        # Check if huggingface_hub is installed
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError:
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="error",
+                    message="huggingface_hub library not installed. Please install it with: pip install huggingface_hub"
+                ).to_json()
+            )
+            return
+        
+        # Get configuration
+        from app.config.settings import model_options
+        config = get_config()
+        
+        # Determine download directory
+        if request.download_location:
+            download_dir = Path(request.download_location)
+            download_dir.mkdir(parents=True, exist_ok=True)
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message=f"Using custom download location: {download_dir}"
+                ).to_json()
+            )
+        else:
+            download_dir = config.get_model_path("")
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message=f"Using default model directory: {download_dir}"
+                ).to_json()
+            )
+        
+        await websocket.send_json(
+            WebSocketMessage(
+                type="status",
+                message=f"Starting download for {len(request.model_ids)} model(s)..."
+            ).to_json()
+        )
+        
+        # Process each model
+        for model_id in request.model_ids:
+            # Validate model_id
+            if model_id not in model_options:
+                await websocket.send_json(
+                    WebSocketMessage(
+                        type="error",
+                        message=f"Invalid model_id: {model_id}. Not found in model_options."
+                    ).to_json()
+                )
+                continue
+            
+            model_info = model_options[model_id]
+            repo_id = model_info.get("repo_id")
+            
+            # Check if repo_id is configured
+            if not repo_id or not repo_id.strip():
+                await websocket.send_json(
+                    WebSocketMessage(
+                        type="error",
+                        message=f"Model {model_id} does not have a repo_id configured. Please add repo_id to model_options in settings.py"
+                    ).to_json()
+                )
+                continue
+            
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message=f"Processing model: {model_id}"
+                ).to_json()
+            )
+            
+            # Get files to download
+            files_to_download = []
+            model_file = model_info.get("model_file")
+            mmproj_file = model_info.get("mmproj_file")
+            
+            if model_file:
+                files_to_download.append(("model", model_file))
+            if mmproj_file:
+                files_to_download.append(("mmproj", mmproj_file))
+            
+            if not files_to_download:
+                await websocket.send_json(
+                    WebSocketMessage(
+                        type="error",
+                        message=f"Model {model_id} has no files configured (model_file or mmproj_file)"
+                    ).to_json()
+                )
+                continue
+            
+            # Download each file
+            file_statuses = []
+            
+            for file_type, filename in files_to_download:
+                # Check if file already exists
+                model_path = download_dir / filename
+                
+                if model_path.exists() and not request.force_redownload:
+                    await websocket.send_json(
+                        WebSocketMessage(
+                            type="progress",
+                            message=f"Skipping {filename} (already exists)",
+                            data={
+                                "filename": filename,
+                                "bytes_downloaded": model_path.stat().st_size,
+                                "total_bytes": model_path.stat().st_size
+                            }
+                        ).to_json()
+                    )
+                    file_statuses.append(DownloadStatus(
+                        filename=filename,
+                        status="skipped",
+                        error=None,
+                        bytes_downloaded=model_path.stat().st_size,
+                        total_bytes=model_path.stat().st_size
+                    ))
+                    continue
+                
+                # Download the file
+                try:
+                    await websocket.send_json(
+                        WebSocketMessage(
+                            type="status",
+                            message=f"Downloading {filename} from {repo_id}..."
+                        ).to_json()
+                    )
+                    
+                    # Ensure download directory exists
+                    download_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Download file
+                    downloaded_path = hf_hub_download(
+                        repo_id=repo_id,
+                        filename=filename,
+                        local_dir=str(download_dir),
+                        local_dir_use_symlinks=False,
+                        resume_download=True
+                    )
+                    
+                    # Get file size
+                    file_size = Path(downloaded_path).stat().st_size
+                    size_mb = file_size / (1024 * 1024)
+                    
+                    await websocket.send_json(
+                        WebSocketMessage(
+                            type="progress",
+                            message=f"Downloaded {filename} ({size_mb:.1f} MB)",
+                            data={
+                                "filename": filename,
+                                "bytes_downloaded": file_size,
+                                "total_bytes": file_size
+                            }
+                        ).to_json()
+                    )
+                    
+                    file_statuses.append(DownloadStatus(
+                        filename=filename,
+                        status="completed",
+                        error=None,
+                        bytes_downloaded=file_size,
+                        total_bytes=file_size
+                    ))
+                    
+                except Exception as e:
+                    error_msg = str(e)
+                    await websocket.send_json(
+                        WebSocketMessage(
+                            type="error",
+                            message=f"Failed to download {filename}: {error_msg}",
+                            data={
+                                "filename": filename,
+                                "error": error_msg,
+                                "repo_id": repo_id
+                            }
+                        ).to_json()
+                    )
+                    file_statuses.append(DownloadStatus(
+                        filename=filename,
+                        status="failed",
+                        error=error_msg,
+                        bytes_downloaded=None,
+                        total_bytes=None
+                    ))
+            
+            # Determine overall status
+            if not file_statuses:
+                overall_status = "failed"
+            elif all(f.status in ["completed", "skipped"] for f in file_statuses):
+                overall_status = "completed"
+            elif any(f.status in ["completed", "skipped"] for f in file_statuses):
+                overall_status = "partial"
+            else:
+                overall_status = "failed"
+            
+            # Send result for this model
+            result = DownloadModelsResponse(
+                model_id=model_id,
+                files=file_statuses,
+                overall_status=overall_status
+            )
+            
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="result",
+                    message=f"Completed processing {model_id}",
+                    data=result.model_dump()
+                ).to_json()
+            )
+        
+        await websocket.send_json(
+            WebSocketMessage(
+                type="status",
+                message="All downloads completed"
+            ).to_json()
+        )
+        
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="error",
+                    message=f"Download error: {str(e)}"
+                ).to_json()
+            )
+        except:
+            pass
+
+
 @router.post("/set-storage-metadata", response_model=StatusResponse)
 async def set_storage_metadata(request: StorageMetadataRequest):
     """Set storage metadata path."""
@@ -210,7 +553,7 @@ async def set_storage_metadata(request: StorageMetadataRequest):
     if not path.is_file():
         raise HTTPException(status_code=400, detail=f"Not a file: {path}")
     
-    # Try to load metadata
+    # Try to load metadata with permission error handling
     try:
         _metadata_store = MetadataStore(str(path))
         set_storage_metadata_path(str(path))
@@ -220,6 +563,11 @@ async def set_storage_metadata(request: StorageMetadataRequest):
         rag_dir = config.get_rag_directory()
         if rag_dir:
             rag_dir.mkdir(exist_ok=True)
+        
+        # Create saved_llm directory if it doesn't exist
+        saved_llm_dir = config.get_saved_llm_directory()
+        if saved_llm_dir:
+            saved_llm_dir.mkdir(parents=True, exist_ok=True)
         
         # Load existing embeddings if available
         embedding_service = get_embedding_service()
@@ -234,13 +582,140 @@ async def set_storage_metadata(request: StorageMetadataRequest):
             data={
                 "metadata_count": len(_metadata_store.get_all_metadata()),
                 "rag_directory": str(rag_dir) if rag_dir else None,
+                "saved_llm_directory": str(saved_llm_dir) if saved_llm_dir else None,
                 "embeddings_loaded": embeddings_loaded,
                 "embeddings_count": len(embedding_service.get_all_embeddings()) if embeddings_loaded else 0,
                 "identified_properties": identified_properties
             }
         )
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to load metadata: {str(e)}")
+        # Check if it's a permission error
+        if is_permission_error(e):
+            # Try to handle with directory picker
+            try:
+                selected_dir = handle_permission_error_with_picker(
+                    e,
+                    operation_name="storage folder",
+                    require_metadata=True
+                )
+                
+                # Retry with the selected dir
+                metadata_file = Path(selected_dir) / "storage_metadata.json"
+                _metadata_store = MetadataStore(str(metadata_file))
+                set_storage_metadata_path(str(metadata_file))
+                
+                # Create RAG directory if it doesn't exist
+                config = get_config()
+                rag_dir = config.get_rag_directory()
+                if rag_dir:
+                    rag_dir.mkdir(exist_ok=True)
+                
+                # Create saved_llm directory if it doesn't exist
+                saved_llm_dir = config.get_saved_llm_directory()
+                if saved_llm_dir:
+                    saved_llm_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Load existing embeddings if available
+                embedding_service = get_embedding_service()
+                embeddings_loaded = embedding_service.load_embeddings()
+                
+                # Get identified metadata properties
+                identified_properties = _metadata_store.get_identified_properties()
+                
+                return StatusResponse(
+                    status="success",
+                    message=f"Permission granted. Storage metadata set to {metadata_file}",
+                    data={
+                        "metadata_count": len(_metadata_store.get_all_metadata()),
+                        "rag_directory": str(rag_dir) if rag_dir else None,
+                        "saved_llm_directory": str(saved_llm_dir) if saved_llm_dir else None,
+                        "embeddings_loaded": embeddings_loaded,
+                        "embeddings_count": len(embedding_service.get_all_embeddings()) if embeddings_loaded else 0,
+                        "identified_properties": identified_properties,
+                        "permission_granted_via_picker": True,
+                        "selected_folder": selected_dir
+                    }
+                )
+            except Exception as picker_error:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Permission denied and folder selection failed: {str(picker_error)}"
+                )
+        else:
+            raise HTTPException(status_code=400, detail=f"Failed to load metadata: {str(e)}")
+
+
+@router.post("/select-storage-metadata", response_model=StatusResponse)
+async def select_storage_metadata():
+    """Open a directory picker dialog to select storage folder containing metadata file."""
+    global _metadata_store
+    
+    try:
+        # Open directory picker dialog
+        selected_dir = open_directory_picker()
+        
+        if not selected_dir:
+            raise HTTPException(status_code=400, detail="No folder selected")
+        
+        dir_path = Path(selected_dir)
+        
+        # Verify directory exists
+        if not dir_path.exists():
+            raise HTTPException(status_code=404, detail=f"Directory not found: {dir_path}")
+        
+        if not dir_path.is_dir():
+            raise HTTPException(status_code=400, detail=f"Not a directory: {dir_path}")
+        
+        # Look for storage_metadata.json in the directory
+        metadata_file = dir_path / "storage_metadata.json"
+        if not metadata_file.exists():
+            raise HTTPException(
+                status_code=404, 
+                detail=f"storage_metadata.json not found in {dir_path}. Please select the correct folder."
+            )
+        
+        path = metadata_file
+        
+        # Try to load metadata
+        _metadata_store = MetadataStore(str(path))
+        set_storage_metadata_path(str(path))
+        
+        # Create RAG directory if it doesn't exist
+        config = get_config()
+        rag_dir = config.get_rag_directory()
+        if rag_dir:
+            rag_dir.mkdir(exist_ok=True)
+        
+        # Create saved_llm directory if it doesn't exist
+        saved_llm_dir = config.get_saved_llm_directory()
+        if saved_llm_dir:
+            saved_llm_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Load existing embeddings if available
+        embedding_service = get_embedding_service()
+        embeddings_loaded = embedding_service.load_embeddings()
+        
+        # Get identified metadata properties
+        identified_properties = _metadata_store.get_identified_properties()
+        
+        return StatusResponse(
+            status="success",
+            message=f"Storage folder set to {dir_path}",
+            data={
+                "metadata_count": len(_metadata_store.get_all_metadata()),
+                "rag_directory": str(rag_dir) if rag_dir else None,
+                "saved_llm_directory": str(saved_llm_dir) if saved_llm_dir else None,
+                "embeddings_loaded": embeddings_loaded,
+                "embeddings_count": len(embedding_service.get_all_embeddings()) if embeddings_loaded else 0,
+                "identified_properties": identified_properties,
+                "selected_folder": str(dir_path),
+                "metadata_file": str(path)
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to open directory picker or load metadata: {str(e)}")
 
 
 @router.post("/load-rag", response_model=StatusResponse)
@@ -252,15 +727,21 @@ async def load_rag():
     # Check if metadata file has been updated and reload if necessary
     await metadata_store.reload_if_modified()
     
-    if rag_service.load_rag(metadata_store):
+    result = rag_service.load_rag(metadata_store)
+    
+    if result["success"]:
         return StatusResponse(
             status="success",
-            message="RAG database loaded successfully"
+            message="RAG database loaded successfully",
+            data={
+                "dimension": result.get("dimension"),
+                "indexed_files": result.get("indexed_files")
+            }
         )
     else:
         raise HTTPException(
             status_code=404,
-            detail="RAG database not found. Generate RAG first using /generate-rag endpoint."
+            detail=result.get("error", "RAG database not found. Generate RAG first using /generate-rag endpoint.")
         )
 
 
@@ -523,12 +1004,31 @@ async def generate_rag_ws(websocket: WebSocket):
         
         await progress_callback("Building RAG database...")
         
-        await rag_service.build_rag(metadata_store, progress_callback)
+        result = await rag_service.build_rag(metadata_store, progress_callback)
+        
+        # Check for mismatched embeddings
+        if result.get("mismatched_files"):
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message=f"Warning: {result['removed_count']} file(s) had mismatched embedding dimensions and were excluded from RAG",
+                    data={
+                        "mismatched_files": result["mismatched_files"],
+                        "majority_dimension": result["majority_dimension"]
+                    }
+                ).to_json()
+            )
         
         await websocket.send_json(
             WebSocketMessage(
                 type="result",
-                message="RAG database created and loaded successfully"
+                message="RAG database created and loaded successfully",
+                data={
+                    "total_indexed": result["total_indexed"],
+                    "removed_count": result["removed_count"],
+                    "mismatched_files": result.get("mismatched_files", []),
+                    "majority_dimension": result["majority_dimension"]
+                }
             ).to_json()
         )
         
@@ -1152,14 +1652,27 @@ async def chat_ws(websocket: WebSocket):
         provided_history = msg_data.get("history")  # Optional chat history (OpenAI format)
         
         # Determine which model to use based on visual chat setting AND whether image is provided
-        # Use vision model only if enable_visual_chat is True AND image_name is provided
+        # Vision models can be used for both text-only chat and vision tasks
         if config.enable_visual_chat and image_name:
+            # Use vision model with image when visual chat is enabled and image is provided
             chat_model = config.vision_model
             mmproj_file = config.mmproj_model
             use_vision = True
         else:
+            # Use configured chat model (which could be a vision model used for text-only chat)
             chat_model = config.chat_model
-            mmproj_file = None
+            # Check if the configured chat_model is actually a vision model
+            from app.config.settings import model_options
+            # Find if this model is a vision model in model_options
+            is_vision_model = False
+            for model_info in model_options.values():
+                if model_info.get("model_file") == chat_model and model_info.get("type") == "vision":
+                    mmproj_file = model_info.get("mmproj_file")
+                    is_vision_model = True
+                    break
+            
+            if not is_vision_model:
+                mmproj_file = None
             use_vision = False
         
         if not user_message:
@@ -1994,6 +2507,9 @@ async def rename_face_id(request: dict):
         
         metadata_store = get_metadata_store()
         face_service = get_face_service()
+        
+        # Check if metadata file has been updated and reload if necessary
+        await metadata_store.reload_if_modified()
         
         # Attempt to rename
         success = face_service.rename_face_id(

@@ -84,25 +84,25 @@ echo "Running PyInstaller..."
 pyinstaller --clean ai_capability.spec
 
 # Check if build was successful
-if [ -f "dist/ai_capability_server/ai_capability_server" ]; then
+if [ -f "dist/visarc_ai_server/visarc_ai_server" ]; then
     echo ""
     echo "============================================================"
     echo "✅ Build successful!"
     echo "============================================================"
     echo ""
-    echo "Output location: dist/ai_capability_server/"
+    echo "Output location: dist/visarc_ai_server/"
     echo ""
     echo "To run the application:"
-    echo "  cd dist/ai_capability_server"
-    echo "  ./ai_capability_server"
+    echo "  cd dist/visarc_ai_server"
+    echo "  ./visarc_ai_server"
     echo ""
     echo "To distribute:"
     echo "  cd dist"
-    echo "  zip -r ai_capability_server.zip ai_capability_server/"
+    echo "  zip -r visarc_ai_server.zip visarc_ai_server/"
     echo ""
     
     # Show size
-    dist_size=$(du -sh dist/ai_capability_server | cut -f1)
+    dist_size=$(du -sh dist/visarc_ai_server | cut -f1)
     echo "Total packaged size: $dist_size"
     echo ""
 else

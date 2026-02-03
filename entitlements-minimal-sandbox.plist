@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- ========== SANDBOX ========== -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    
+    <!-- Inherit from parent app (CRITICAL: visarc_ai_server is embedded in VisArc PC.app) -->
+    <key>com.apple.security.inherit</key>
+    <true/>
+    
+    <!-- ========== NETWORK ========== -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.network.server</key>
+    <true/>
+    
+    <!-- ========== FILE ACCESS ========== -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    
+    <!-- ========== TEMPORARY FILES ========== -->
+    <!-- OPTIONAL: Only needed if using tempfile.NamedTemporaryFile -->
+    <!-- Used in vision_service.py and llm_service.py for image processing -->
+    <!-- Can be removed if you refactor to use in-memory buffers -->
+    <key>com.apple.security.temporary-exception.files.absolute-path.read-write</key>
+    <array>
+        <string>/tmp/</string>
+    </array>
+    
+    <!-- ========== HARDENED RUNTIME ========== -->
+    <!-- Python JIT compilation -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    
+    <!-- NumPy, OpenCV, ML libraries need unsigned executable memory -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    
+    <!-- CRITICAL FIX #2: PyInstaller bundles multiple dylibs (NumPy, OpenCV, ONNXRuntime) -->
+    <!-- Without this: Library load error on startup (instant crash) -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    
+    <!-- CRITICAL FIX #3: Allows spawning subprocesses (llama-server, llama-cli) -->
+    <!-- Without this: Cannot execute subprocess (instant crash) -->
+    <key>com.apple.security.cs.disable-executable-page-protection</key>
+    <true/>
+</dict>
+</plist>

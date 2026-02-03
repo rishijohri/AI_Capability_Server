@@ -10,6 +10,17 @@ http://localhost:8000
 
 ## Important Notes
 
+### 🔥 Hot Reload - No Restart Required
+
+The server supports **hot reload** - all configuration changes, model directory updates, and new model downloads take effect **immediately without restarting the server**:
+
+- ✅ Configuration changes via `POST /api/config` are instant
+- ✅ Model directory changes immediately affect model path resolution
+- ✅ Downloaded models become available instantly
+- ✅ No downtime or service interruption
+
+See [HOT_RELOAD_GUIDE.md](HOT_RELOAD_GUIDE.md) for details.
+
 ### LLM Backend Behavior
 
 The `llm_mode` (or `backend`) configuration controls which LLM backend is used for **all** LLM tasks:
@@ -55,6 +66,8 @@ The `fileName` field in `storage_metadata.json` should contain only the filename
 | `/api/config` | GET | Get current configuration |
 | `/api/config` | POST | Update configuration |
 | `/api/available-models` | GET | Get available models filtered by task type |
+| `/api/model-options` | GET | Get all downloadable models (with repo_id configuration) |
+| `/api/download-models` | WebSocket | Download models from Hugging Face repositories |
 | `/api/set-storage-metadata` | POST | Set metadata file path |
 | `/api/load-rag` | POST | Load RAG database |
 | `/api/kill` | POST | Shutdown server and all processes |
@@ -148,7 +161,7 @@ curl http://localhost:8000/api/config
 
 ### POST /api/config
 
-Update server configuration. Only editable fields can be changed.
+Update server configuration. Only editable fields can be changed. **Changes take effect immediately without restarting the server** (hot reload).
 
 **Request:**
 ```bash
@@ -167,12 +180,22 @@ curl -X POST http://localhost:8000/api/config \
     "top_k": 10,
     "recency_bias": 0.5,
     "backend": "server",
+    "model_directory": "/custom/path/to/models",
     "llm_params": {
       "ctx_size": 8192,
       "temp": 0.7
     }
   }'
 ```
+
+**Editable Fields:**
+- `model_directory`: Custom model directory path (absolute path). Set to null to use default saved_llm location. **Changes take effect immediately** - all subsequent model operations use the new directory.
+- All other fields from GET /api/config marked as editable
+
+**Hot Reload Behavior:**
+- Config changes propagate immediately to all endpoints
+- `model_directory` changes affect `/api/available-models` and model loading instantly
+- No server restart required for any configuration change
 
 **Response:** `200 OK` - Same structure as GET /config with updated values
 
@@ -194,7 +217,7 @@ curl -X POST http://localhost:8000/api/config \
 
 ### GET /api/available-models
 
-Get a list of available models filtered by task type. This endpoint checks which models actually exist in the model folder and returns their availability status.
+Get a list of available models filtered by task type. This endpoint checks which models actually exist in the model folder and returns their availability status. **Model availability reflects the current `model_directory` setting immediately** (hot reload).
 
 **Query Parameters:**
 - `task_type` (optional): Filter models by task type. Valid values: `vision`, `chat`, `embedding`
@@ -214,6 +237,11 @@ curl "http://localhost:8000/api/available-models?task_type=chat"
 # Get only embedding models
 curl "http://localhost:8000/api/available-models?task_type=embedding"
 ```
+
+**Hot Reload Behavior:**
+- Reflects current `model_directory` immediately after changes
+- Shows newly downloaded models without server restart
+- File existence checked at request time, not cached
 
 **Response:** `200 OK`
 ```json
@@ -284,9 +312,352 @@ curl "http://localhost:8000/api/available-models?task_type=embedding"
 
 ---
 
+### GET /api/model-options
+
+Get all models that can be downloaded, regardless of whether they exist locally. This endpoint shows all models defined in `model_options` with their download configuration status.
+
+**Difference from `/api/available-models`:**
+- `/api/available-models`: Returns only models with files that exist on disk
+- `/api/model-options`: Returns all models in configuration, showing which have `repo_id` configured for download
+
+**Request:**
+```bash
+curl http://localhost:8000/api/model-options
+
+# Filter by task type
+curl http://localhost:8000/api/model-options?task_type=vision
+```
+
+**Query Parameters:**
+- `task_type` (optional): Filter by `vision`, `chat`, or `embedding`
+
+**Response:** `200 OK`
+```json
+{
+  "models": [
+    {
+      "model_id": "qwen_3_0.6B",
+      "name": "qwen_3_0.6B",
+      "type": "chat",
+      "model_file": "Qwen3-0.6B-Q4_K_M.gguf",
+      "mmproj_file": null,
+      "repo_id": "Qwen/Qwen3-0.6B-GGUF",
+      "repo_id_configured": true,
+      "llm_params": null
+    },
+    {
+      "model_id": "gemma3_4b_q4_k_m",
+      "name": "gemma3_4b_q4_k_m",
+      "type": "vision",
+      "model_file": "gemma-3-4b-it-Q4_K_M.gguf",
+      "mmproj_file": "gemma_3_mmproj-F16.gguf",
+      "repo_id": "",
+      "repo_id_configured": false,
+      "llm_params": null
+    }
+  ],
+  "total_count": 2,
+  "configured_count": 1,
+  "task_type": null
+}
+```
+
+**Response Fields:**
+- `models`: Array of model configuration objects
+  - `model_id`: Model identifier (key in `model_options`, used for download requests)
+  - `name`: Model name
+  - `type`: Model type (`vision`, `chat`, or `embedding`)
+  - `model_file`: Model filename
+  - `mmproj_file`: MMProj file for vision models (null for non-vision)
+  - `repo_id`: Hugging Face repository ID
+  - `repo_id_configured`: Boolean indicating if `repo_id` is configured (non-empty)
+  - `llm_params`: Model-specific LLM parameters (if configured)
+- `total_count`: Total number of models returned
+- `configured_count`: Number of models with `repo_id` configured (ready to download)
+- `task_type`: Filter applied (if any)
+
+**Use Cases:**
+- Check which models can be downloaded before calling `/api/download-models`
+- Identify models missing `repo_id` configuration
+- List all available model IDs for download requests
+- Filter downloadable models by type
+
+**Python Example:**
+```python
+import requests
+
+# Get all downloadable models
+response = requests.get("http://localhost:8000/api/model-options")
+data = response.json()
+
+print(f"Total models: {data['total_count']}")
+print(f"Configured for download: {data['configured_count']}")
+
+# Show models ready to download
+for model in data['models']:
+    if model['repo_id_configured']:
+        print(f"✓ {model['model_id']}: {model['repo_id']}")
+    else:
+        print(f"✗ {model['model_id']}: repo_id not configured")
+```
+
+**JavaScript Example:**
+```javascript
+fetch('http://localhost:8000/api/model-options?task_type=vision')
+  .then(res => res.json())
+  .then(data => {
+    console.log(`Found ${data.total_count} vision models`);
+    console.log(`${data.configured_count} ready for download`);
+    
+    data.models.forEach(model => {
+      const status = model.repo_id_configured ? '✓' : '✗';
+      console.log(`${status} ${model.model_id}`);
+    });
+  });
+```
+
+---
+
+### WebSocket /api/download-models
+
+Download models from Hugging Face repositories. This endpoint downloads model files and mmproj files (for vision models) directly from configured Hugging Face repositories.
+
+**Prerequisites:**
+1. Install `huggingface_hub`: `pip install huggingface_hub`
+2. Configure `repo_id` for models in `app/config/settings.py` (see [MODEL_DOWNLOAD_GUIDE.md](MODEL_DOWNLOAD_GUIDE.md))
+
+**WebSocket Connection:**
+```javascript
+const ws = new WebSocket('ws://localhost:8000/api/download-models');
+```
+
+**Request Message:**
+```json
+{
+  "model_ids": ["qwen_3_0.6B", "gemma3_4b_q4_k_m"],
+  "force_redownload": false,
+  "download_location": null
+}
+```
+
+**Request Fields:**
+- `model_ids` (required): Array of model IDs from `model_options` to download
+- `force_redownload` (optional, default: false): If true, re-downloads files even if they already exist
+- `download_location` (optional, default: null): Custom download location (absolute path). If null, uses configured `model_directory` or default location
+
+**Response Messages:**
+
+The endpoint sends multiple WebSocket messages with different types:
+
+**1. Status Message** - General progress updates:
+```json
+{
+  "type": "status",
+  "message": "Starting download for 2 model(s)...",
+  "data": null
+}
+```
+
+**2. Progress Message** - Download progress with file information:
+```json
+{
+  "type": "progress",
+  "message": "Downloaded Qwen3-0.6B-Q4_K_M.gguf (512.5 MB)",
+  "data": {
+    "filename": "Qwen3-0.6B-Q4_K_M.gguf",
+    "bytes_downloaded": 537395200,
+    "total_bytes": 537395200
+  }
+}
+```
+
+**3. Result Message** - Completion status for each model:
+```json
+{
+  "type": "result",
+  "message": "Completed processing qwen_3_0.6B",
+  "data": {
+    "model_id": "qwen_3_0.6B",
+    "overall_status": "completed",
+    "files": [
+      {
+        "filename": "Qwen3-0.6B-Q4_K_M.gguf",
+        "status": "completed",
+        "error": null,
+        "bytes_downloaded": 537395200,
+        "total_bytes": 537395200
+      }
+    ]
+  }
+}
+```
+
+**4. Error Message** - Download errors:
+```json
+{
+  "type": "error",
+  "message": "Failed to download model_file.gguf: Connection timeout",
+  "data": {
+    "filename": "model_file.gguf",
+    "error": "Connection timeout",
+    "repo_id": "username/repo"
+  }
+}
+```
+
+**File Status Values:**
+- `pending`: Download not yet started
+- `downloading`: Currently downloading
+- `completed`: Successfully downloaded
+- `failed`: Download failed with error
+- `skipped`: File already exists (use `force_redownload: true` to re-download)
+
+**Overall Status Values:**
+- `completed`: All files downloaded successfully (or skipped)
+- `partial`: Some files succeeded, some failed
+- `failed`: All files failed to download
+
+**Python Example:**
+```python
+import asyncio
+import json
+import websockets
+
+async def download_models():
+    uri = "ws://localhost:8000/api/download-models"
+    
+    async with websockets.connect(uri) as websocket:
+        # Send download request with custom location
+        await websocket.send(json.dumps({
+            "model_ids": ["qwen_3_0.6B"],
+            "force_redownload": False,
+            "download_location": "/custom/models/path"  # Optional
+        }))
+        
+        # Receive progress updates
+        async for message in websocket:
+            data = json.loads(message)
+            print(f"[{data['type']}] {data['message']}")
+            
+            if data['type'] == 'progress' and data.get('data'):
+                bytes_dl = data['data']['bytes_downloaded']
+                total = data['data']['total_bytes']
+                percent = (bytes_dl / total) * 100 if total > 0 else 0
+                print(f"  Progress: {percent:.1f}%")
+
+asyncio.run(download_models())
+```
+
+**JavaScript Example:**
+```javascript
+const ws = new WebSocket('ws://localhost:8000/api/download-models');
+
+ws.onopen = () => {
+    ws.send(JSON.stringify({
+        model_ids: ["qwen_3_0.6B", "gemma3_4b_q4_k_m"],
+        force_redownload: false,
+        download_location: "/custom/models/path"  // Optional
+    }));
+};
+
+ws.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    console.log(`[${data.type}] ${data.message}`);
+    
+    if (data.type === 'progress' && data.data) {
+        const percent = (data.data.bytes_downloaded / data.data.total_bytes) * 100;
+        console.log(`  ${data.data.filename}: ${percent.toFixed(1)}%`);
+    }
+};
+
+ws.onerror = (error) => console.error('Error:', error);
+ws.onclose = () => console.log('Download complete');
+```
+
+**Common Errors:**
+
+**Missing repo_id:**
+```json
+{
+  "type": "error",
+  "message": "Model qwen_3 does not have a repo_id configured. Please add repo_id to model_options in settings.py"
+}
+```
+Solution: Add `"repo_id": "username/repo-name"` to the model in `app/config/settings.py`
+
+**Invalid model_id:**
+```json
+{
+  "type": "error",
+  "message": "Invalid model_id: unknown_model. Not found in model_options."
+}
+```
+Solution: Use a valid model ID from `model_options`
+
+**Library not installed:**
+```json
+{
+  "type": "error",
+  "message": "huggingface_hub library not installed. Please install it with: pip install huggingface_hub"
+}
+```
+Solution: `pip install huggingface_hub`
+
+**File not found in repository:**
+```json
+{
+  "type": "error",
+  "message": "Failed to download: File not found",
+  "data": {
+    "filename": "model-file.gguf",
+    "error": "File not found in repository",
+    "repo_id": "username/repo"
+  }
+}
+```
+Solution: Verify the `model_file` name matches the exact filename in the Hugging Face repository
+
+**Use Cases:**
+- Initial setup: Download all required models
+- Model updates: Re-download models when new versions are available
+- Automated deployment: Download models as part of server initialization
+- Testing: Download small models for testing purposes
+
+**Important - Model Storage Location:**
+- **Custom `download_location`**: If provided in the request, downloads to this specific path
+- **Custom `model_directory`**: If set via POST /api/config, downloads to this path (when download_location is null)
+- **Default behavior**: Downloads to `saved_llm/` alongside storage-metadata.json
+- **Fallback**: Downloads to project `model/` directory if storage metadata not set
+- Example: If your storage metadata is at `/Users/you/data/storage-metadata.json`, LLM models will be stored in `/Users/you/data/saved_llm/`
+- **Note:** Face recognition models (buffalo_l) always remain in the static `model/models/` directory and are not moved to `saved_llm/`
+
+**Priority Order for Download Location:**
+1. `download_location` parameter (if provided in request)
+2. `model_directory` config (if set via POST /api/config)
+3. `saved_llm/` folder (if storage_metadata_path is set)
+4. Default `model/` directory (fallback)
+
+**Notes:**
+- Downloads are resumable - interrupted downloads can be resumed automatically
+- For vision models, both `model_file` and `mmproj_file` are downloaded from the same repository
+- Large models (2-8 GB) may take significant time depending on connection speed
+- Downloads work correctly in both development and PyInstaller-packaged modes
+
+**See Also:**
+- [MODEL_DOWNLOAD_GUIDE.md](MODEL_DOWNLOAD_GUIDE.md) - Complete download feature documentation
+- [REPO_ID_EXAMPLES.md](REPO_ID_EXAMPLES.md) - Example repository IDs for all models
+
+---
+
 ### POST /api/set-storage-metadata
 
 Set the path to the storage metadata JSON file. This file contains information about all files to be indexed. Must be called before using other endpoints.
+
+**Important:** When you set the storage metadata path, the following directories are automatically created in the same location:
+- `rag_db/` - For RAG database files
+- `saved_llm/` - For downloaded LLM models (GGUF files only)
+
+**Note:** Face recognition models (buffalo_l) remain in the static `model/models/` directory in the project root and are not affected by this setting.
 
 **Request:**
 ```bash
@@ -305,6 +676,7 @@ curl -X POST http://localhost:8000/api/set-storage-metadata \
   "data": {
     "metadata_count": 156,
     "rag_directory": "/Users/username/data/rag",
+    "saved_llm_directory": "/Users/username/data/saved_llm",
     "embeddings_loaded": true,
     "embeddings_count": 156
   }
@@ -342,14 +714,29 @@ curl -X POST http://localhost:8000/api/load-rag
 ```json
 {
   "status": "success",
-  "message": "RAG database loaded successfully"
+  "message": "RAG database loaded successfully",
+  "data": {
+    "dimension": 768,
+    "indexed_files": 156
+  }
 }
 ```
+
+**Response Fields:**
+- `dimension`: The embedding dimension of the loaded RAG index
+- `indexed_files`: Number of files in the RAG index
 
 **Error Response:** `400 Bad Request`
 ```json
 {
   "detail": "Storage metadata not set. Call /set-storage-metadata first."
+}
+```
+
+**Error Response:** `404 Not Found`
+```json
+{
+  "detail": "RAG database not found. Generate RAG first using /generate-rag endpoint."
 }
 ```
 
@@ -1003,6 +1390,12 @@ asyncio.run(regenerate_all())
 
 Build the RAG (Retrieval Augmented Generation) database from embeddings. Creates a FAISS index for fast similarity search and saves it to disk.
 
+**Important:** If embeddings have different dimensions (e.g., from different embedding models), the system will:
+1. Detect all embedding dimensions
+2. Use the majority dimension (most common)
+3. Exclude files with mismatched dimensions from the RAG
+4. Return the list of excluded files so you can re-embed them with the correct model
+
 **Connection:** `ws://localhost:8000/api/generate-rag`
 
 **1. Client Connects (No Initial Message Required)**
@@ -1022,6 +1415,25 @@ Build the RAG (Retrieval Augmented Generation) database from embeddings. Creates
 }
 ```
 
+**Dimension Mismatch Warning (if applicable):**
+```json
+{
+  "type": "status",
+  "message": "Warning: 3 file(s) had mismatched embedding dimensions and were excluded from RAG",
+  "data": {
+    "mismatched_files": ["image1.jpg", "image2.jpg", "video1.mp4"],
+    "majority_dimension": 768
+  }
+}
+```
+
+```json
+{
+  "type": "status",
+  "message": "Removing image1.jpg: dimension 1024 (expected 768)"
+}
+```
+
 ```json
 {
   "type": "status",
@@ -1033,9 +1445,21 @@ Build the RAG (Retrieval Augmented Generation) database from embeddings. Creates
 ```json
 {
   "type": "result",
-  "message": "RAG database created and loaded successfully"
+  "message": "RAG database created and loaded successfully",
+  "data": {
+    "total_indexed": 153,
+    "removed_count": 3,
+    "mismatched_files": ["image1.jpg", "image2.jpg", "video1.mp4"],
+    "majority_dimension": 768
+  }
 }
 ```
+
+**Result Data Fields:**
+- `total_indexed`: Number of files successfully added to the RAG index
+- `removed_count`: Number of files excluded due to dimension mismatch
+- `mismatched_files`: List of filenames that were excluded (re-embed these with the correct model)
+- `majority_dimension`: The embedding dimension used for the RAG index
 
 **4. Connection Closes**
 
@@ -1049,9 +1473,17 @@ No embeddings available:
 }
 ```
 
-**Note:** The RAG database is saved to `{metadata_directory}/rag/` as:
-- `faiss.index` - FAISS vector index
-- `metadata.json` - File metadata mapping
+**Use Case - Handling Mismatched Embeddings:**
+
+If files were excluded due to dimension mismatch:
+1. Note the `mismatched_files` list from the result
+2. Check which embedding model was used for those files
+3. Re-generate embeddings for those files using the correct model (matching `majority_dimension`)
+4. Rebuild the RAG database
+
+**Note:** The RAG database is saved to `{metadata_directory}/rag_db/` as:
+- `faiss_index.bin` - FAISS vector index
+- `faiss_index_idmap.pkl` - File ID mapping
 
 ---
 

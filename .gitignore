@@ -57,3 +57,5 @@ temp/
 binary/
 model/
 descoped_model/
+dist/
+macos/

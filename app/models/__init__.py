@@ -8,14 +8,19 @@ from app.models.requests import (
     DescribeRequest,
     ChatMessage,
     ChatRequest,
-    AvailableModelsRequest
+    AvailableModelsRequest,
+    DownloadModelsRequest
 )
 from .responses import (
     ConfigResponse,
     StatusResponse,
     WebSocketMessage,
     ModelInfo,
-    AvailableModelsResponse
+    AvailableModelsResponse,
+    DownloadStatus,
+    DownloadModelsResponse,
+    ModelOption,
+    ModelOptionsResponse
 )
 
 __all__ = [
@@ -28,9 +33,14 @@ __all__ = [
     "ChatMessage",
     "ChatRequest",
     "AvailableModelsRequest",
+    "DownloadModelsRequest",
     "ConfigResponse",
     "StatusResponse",
     "WebSocketMessage",
     "ModelInfo",
-    "AvailableModelsResponse"
+    "AvailableModelsResponse",
+    "DownloadStatus",
+    "DownloadModelsResponse",
+    "ModelOption",
+    "ModelOptionsResponse"
 ]

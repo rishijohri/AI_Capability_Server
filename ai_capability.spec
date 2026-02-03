@@ -63,6 +63,23 @@ if model_dir.exists():
                 dest_dir = 'model' / rel_path.parent
                 datas.append((str(src_path), str(dest_dir)))
 
+# Bundle certifi CA certificates (critical for HTTPS in sandbox)
+try:
+    import certifi
+    cert_file = certifi.where()
+    if Path(cert_file).exists():
+        # Bundle as certifi/cacert.pem (expected by runtime hook)
+        datas.append((cert_file, 'certifi'))
+        print(f"[SPEC] Bundling certifi certificate: {cert_file}")
+    else:
+        print(f"[SPEC] WARNING: certifi.where() returned non-existent file: {cert_file}")
+except ImportError as e:
+    print(f"[SPEC] ERROR: certifi not found - {e}")
+    print("[SPEC] Install with: pip install certifi")
+except Exception as e:
+    print(f"[SPEC] ERROR: Failed to bundle certifi: {e}")
+    import traceback
+    traceback.print_exc()
 
 
 # Hidden imports that PyInstaller might miss
@@ -91,6 +108,9 @@ hiddenimports = [
     'onnxruntime',
     'onnxruntime.capi',
     'onnxruntime.capi.onnxruntime_pybind11_state',
+    # SSL certificate management for HTTPS in sandbox
+    'certifi',
+    'ssl',
 ]
 
 # Analysis
@@ -102,7 +122,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=['hook-ssl-certifi.py'],  # Configure SSL before any imports
     excludes=[],
     noarchive=False,
     optimize=0,
@@ -118,8 +138,8 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,  # CRITICAL: Must be True for folder-based distribution
-    name='ai_capability_server',
-    debug=False,
+    name='visarc_ai_server',
+    debug=True,  # TEMPORARY: Enable debug mode to capture early failures
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
@@ -128,12 +148,21 @@ exe = EXE(
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
-    entitlements_file=None,
+    entitlements_file='entitlements-minimal.plist',  # Minimal sandbox entitlements (uses bundled certifi)
+    bundle_identifier='com.memoin.visarcpc.visarc-ai-server',
+    info_plist={
+        'CFBundleIdentifier': 'com.memoin.visarcpc.visarc-ai-server',
+        'CFBundleName': 'visarc_ai_server',
+        'CFBundleDisplayName': 'Visarc AI Server',
+        'CFBundleVersion': '1.0.0',
+        'CFBundleShortVersionString': '1.0.0',
+        'LSMinimumSystemVersion': '11.0',
+    },
 )
 
 # COLLECT - Bundles everything into a folder
-# This creates dist/ai_capability_server/ directory with:
-#   - ai_capability_server (executable)
+# This creates dist/visarc_ai_server/ directory with:
+#   - visarc_ai_server (executable)
 #   - binary/ (llama binaries)
 #   - model/ (model files)
 #   - All Python dependencies
@@ -144,5 +173,22 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='ai_capability_server',
+    name='visarc_ai_server',
+)
+
+app = BUNDLE(
+    coll,
+    name='visarc_ai_server.app', # THIS is where the .app extension goes
+    icon=None,
+    bundle_identifier='com.memoin.visarcpc.visarc-ai-server',
+    info_plist={
+        'CFBundleIdentifier': 'com.memoin.visarcpc.visarc-ai-server',
+        'CFBundleName': 'visarc_ai_server',
+        'CFBundleDisplayName': 'Visarc AI Server',
+        'CFBundleVersion': '1.0.0',
+        'CFBundleShortVersionString': '1.0.0',
+        'LSMinimumSystemVersion': '11.0',
+        'NSHighResolutionCapable': 'True',
+        'LSBackgroundOnly': 'True', # Crucial: Tells OS this is a background helper
+    }
 )

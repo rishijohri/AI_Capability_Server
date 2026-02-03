@@ -2,5 +2,12 @@
 
 from .image_processor import ImageProcessor
 from .process_manager import ProcessManager, get_process_manager
+from .logging_config import get_logger, initialize_logging
 
-__all__ = ["ImageProcessor", "ProcessManager", "get_process_manager"]
+__all__ = [
+    "ImageProcessor",
+    "ProcessManager", 
+    "get_process_manager",
+    "get_logger",
+    "initialize_logging",
+]
