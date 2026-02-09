@@ -124,10 +124,31 @@ class LlamaServerBackend(LLMBackend):
         return None
     
     async def _wait_for_server(self, timeout: int = 60) -> None:
-        """Wait for server to be ready."""
+        """Wait for server to be ready.
+        
+        Polls the /health endpoint and checks that the subprocess is still alive.
+        If the process dies before becoming healthy, the actual stderr is surfaced.
+        """
         start_time = asyncio.get_event_loop().time()
         
         while True:
+            # --- Check if the process crashed before becoming healthy ---
+            proc = self.process_manager.active_processes.get(self.process_name)
+            if proc is not None and proc.poll() is not None:
+                # Process exited — collect stderr for diagnostics
+                exit_code = proc.returncode
+                stderr_output = ""
+                try:
+                    _, stderr_output = proc.communicate(timeout=5)
+                except Exception:
+                    stderr_output = "(unable to read stderr)"
+                raise RuntimeError(
+                    f"llama-server exited immediately with code {exit_code}.\n"
+                    f"Command: {self.get_startup_command()}\n"
+                    f"Stderr: {stderr_output[-2000:] if stderr_output else '(empty)'}"
+                )
+            
+            # --- Poll health endpoint ---
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(f"{self.base_url}/health") as response:
@@ -137,7 +158,19 @@ class LlamaServerBackend(LLMBackend):
                 pass
             
             if asyncio.get_event_loop().time() - start_time > timeout:
-                raise TimeoutError("Llama-server failed to start within timeout")
+                # Timeout — try to capture any output from the still-running process
+                stderr_hint = ""
+                if proc is not None:
+                    try:
+                        proc.kill()
+                        _, stderr_hint = proc.communicate(timeout=5)
+                    except Exception:
+                        pass
+                raise TimeoutError(
+                    f"Llama-server failed to start within {timeout}s.\n"
+                    f"Command: {self.get_startup_command()}\n"
+                    f"Stderr: {stderr_hint[-2000:] if stderr_hint else '(empty)'}"
+                )
             
             await asyncio.sleep(1)
     

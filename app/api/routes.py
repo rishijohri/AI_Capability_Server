@@ -10,12 +10,15 @@ import os
 import signal
 from typing import Optional
 from datetime import datetime
+import sys
 
 from app.config import get_config, update_config, set_storage_metadata_path, get_available_models
+from app.utils.bookmark_resolver import resolve_security_scoped_bookmark
 from app.models import (
     ConfigUpdateRequest,
     ConfigResponse,
     StorageMetadataRequest,
+    ModelDirectoryRequest,
     StatusResponse,
     TagRequest,
     DescribeRequest,
@@ -27,13 +30,10 @@ from app.models import (
     ModelInfo,
     AvailableModelsResponse,
     ModelOption,
-    ModelOptionsResponse
+    ModelOptionsResponse,
+    SetModelOptionsRequest
 )
-from app.utils.file_picker import (
-    open_directory_picker,
-    is_permission_error,
-    handle_permission_error_with_picker
-)
+from app.utils.file_picker import is_permission_error
 from app.services import (
     get_llm_service,
     get_embedding_service,
@@ -280,6 +280,57 @@ async def get_model_options(task_type: Optional[str] = None):
         configured_count=configured_count,
         task_type=task_type
     )
+
+
+@router.post("/set-model-options", response_model=StatusResponse)
+async def set_model_options(request: SetModelOptionsRequest):
+    """Set model options from the Flutter app.
+    
+    This endpoint receives model configurations from the Flutter client,
+    which now manages persistent model options locally and syncs them
+    to the server on startup. This replaces the static model_options
+    dictionary with runtime configurations.
+    
+    Args:
+        request: SetModelOptionsRequest with list of model options
+        
+    Returns:
+        StatusResponse with success/failure status
+    """
+    from app.config.settings import model_options
+    
+    try:
+        # Clear existing model_options and replace with client-provided ones
+        model_options.clear()
+        
+        received_count = 0
+        for model in request.models:
+            model_dict = {
+                "name": model.name,
+                "type": model.type,
+                "model_file": model.model_file,
+                "repo_id": model.repo_id,
+            }
+            
+            # Add optional fields if present
+            if model.mmproj_file:
+                model_dict["mmproj_file"] = model.mmproj_file
+            if model.llm_params:
+                model_dict["llm_params"] = model.llm_params
+                
+            model_options[model.model_id] = model_dict
+            received_count += 1
+        
+        return StatusResponse(
+            status="success",
+            message=f"Successfully set {received_count} model options"
+        )
+        
+    except Exception as e:
+        return StatusResponse(
+            status="error",
+            message=f"Failed to set model options: {str(e)}"
+        )
 
 
 @router.websocket("/download-models")
@@ -541,10 +592,32 @@ async def download_models_ws(websocket: WebSocket):
 
 @router.post("/set-storage-metadata", response_model=StatusResponse)
 async def set_storage_metadata(request: StorageMetadataRequest):
-    """Set storage metadata path."""
+    """Set storage metadata path.
+    
+    On macOS, if a security-scoped bookmark is provided, it will be resolved
+    first to gain sandbox access to the user-selected folder.
+    """
     global _metadata_store
     
-    path = Path(request.path)
+    # On macOS, resolve security-scoped bookmark if provided
+    bookmark_resolved = False
+    if request.bookmark and sys.platform == "darwin":
+        resolved_path, error = resolve_security_scoped_bookmark(request.bookmark)
+        if error:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to resolve security-scoped bookmark: {error}"
+            )
+        # The bookmark resolves to the directory, so we append the filename
+        resolved_dir = Path(resolved_path)
+        # Check if the resolved path is the metadata file itself or the directory
+        if resolved_dir.is_file() and resolved_dir.name == "storage_metadata.json":
+            path = resolved_dir
+        else:
+            path = resolved_dir / "storage_metadata.json"
+        bookmark_resolved = True
+    else:
+        path = Path(request.path)
     
     # Verify path exists
     if not path.exists():
@@ -553,7 +626,7 @@ async def set_storage_metadata(request: StorageMetadataRequest):
     if not path.is_file():
         raise HTTPException(status_code=400, detail=f"Not a file: {path}")
     
-    # Try to load metadata with permission error handling
+    # Try to load metadata
     try:
         _metadata_store = MetadataStore(str(path))
         set_storage_metadata_path(str(path))
@@ -575,148 +648,111 @@ async def set_storage_metadata(request: StorageMetadataRequest):
         
         # Get identified metadata properties
         identified_properties = _metadata_store.get_identified_properties()
+        
+        response_data = {
+            "metadata_count": len(_metadata_store.get_all_metadata()),
+            "rag_directory": str(rag_dir) if rag_dir else None,
+            "saved_llm_directory": str(saved_llm_dir) if saved_llm_dir else None,
+            "embeddings_loaded": embeddings_loaded,
+            "embeddings_count": len(embedding_service.get_all_embeddings()) if embeddings_loaded else 0,
+            "identified_properties": identified_properties
+        }
+        
+        if bookmark_resolved:
+            response_data["bookmark_resolved"] = True
+            response_data["resolved_path"] = str(path)
         
         return StatusResponse(
             status="success",
             message=f"Storage metadata set to {path}",
-            data={
-                "metadata_count": len(_metadata_store.get_all_metadata()),
-                "rag_directory": str(rag_dir) if rag_dir else None,
-                "saved_llm_directory": str(saved_llm_dir) if saved_llm_dir else None,
-                "embeddings_loaded": embeddings_loaded,
-                "embeddings_count": len(embedding_service.get_all_embeddings()) if embeddings_loaded else 0,
-                "identified_properties": identified_properties
-            }
+            data=response_data
+        )
+    except PermissionError as e:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Permission denied: {str(e)}. The main app should provide a security-scoped bookmark."
         )
     except Exception as e:
-        # Check if it's a permission error
-        if is_permission_error(e):
-            # Try to handle with directory picker
-            try:
-                selected_dir = handle_permission_error_with_picker(
-                    e,
-                    operation_name="storage folder",
-                    require_metadata=True
-                )
-                
-                # Retry with the selected dir
-                metadata_file = Path(selected_dir) / "storage_metadata.json"
-                _metadata_store = MetadataStore(str(metadata_file))
-                set_storage_metadata_path(str(metadata_file))
-                
-                # Create RAG directory if it doesn't exist
-                config = get_config()
-                rag_dir = config.get_rag_directory()
-                if rag_dir:
-                    rag_dir.mkdir(exist_ok=True)
-                
-                # Create saved_llm directory if it doesn't exist
-                saved_llm_dir = config.get_saved_llm_directory()
-                if saved_llm_dir:
-                    saved_llm_dir.mkdir(parents=True, exist_ok=True)
-                
-                # Load existing embeddings if available
-                embedding_service = get_embedding_service()
-                embeddings_loaded = embedding_service.load_embeddings()
-                
-                # Get identified metadata properties
-                identified_properties = _metadata_store.get_identified_properties()
-                
-                return StatusResponse(
-                    status="success",
-                    message=f"Permission granted. Storage metadata set to {metadata_file}",
-                    data={
-                        "metadata_count": len(_metadata_store.get_all_metadata()),
-                        "rag_directory": str(rag_dir) if rag_dir else None,
-                        "saved_llm_directory": str(saved_llm_dir) if saved_llm_dir else None,
-                        "embeddings_loaded": embeddings_loaded,
-                        "embeddings_count": len(embedding_service.get_all_embeddings()) if embeddings_loaded else 0,
-                        "identified_properties": identified_properties,
-                        "permission_granted_via_picker": True,
-                        "selected_folder": selected_dir
-                    }
-                )
-            except Exception as picker_error:
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"Permission denied and folder selection failed: {str(picker_error)}"
-                )
-        else:
-            raise HTTPException(status_code=400, detail=f"Failed to load metadata: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Failed to load metadata: {str(e)}")
 
 
-@router.post("/select-storage-metadata", response_model=StatusResponse)
-async def select_storage_metadata():
-    """Open a directory picker dialog to select storage folder containing metadata file."""
-    global _metadata_store
+# NOTE: select_storage_metadata endpoint has been removed.
+# This server runs as a background helper process that cannot make GUI calls.
+# The main app should use /set-storage-metadata with a security-scoped bookmark instead.
+
+
+@router.post("/set-model-directory", response_model=StatusResponse)
+async def set_model_directory(request: ModelDirectoryRequest):
+    """Set model directory path with optional bookmark for sandbox access.
+    
+    On macOS, if a security-scoped bookmark is provided, it will be resolved
+    first to gain sandbox access to the model directory. This access is then
+    inherited by child processes like llama-server.
+    
+    Args:
+        request: ModelDirectoryRequest with path and optional bookmark
+        
+    Returns:
+        StatusResponse with success/failure and resolved path info
+    """
+    # On macOS, resolve security-scoped bookmark if provided
+    bookmark_resolved = False
+    resolved_path = request.path
+    
+    if request.bookmark and sys.platform == "darwin":
+        path_from_bookmark, error = resolve_security_scoped_bookmark(request.bookmark)
+        if error:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to resolve security-scoped bookmark: {error}"
+            )
+        resolved_path = path_from_bookmark
+        bookmark_resolved = True
+    
+    # Verify path is a valid directory (or can be created)
+    path = Path(resolved_path)
     
     try:
-        # Open directory picker dialog
-        selected_dir = open_directory_picker()
+        if not path.exists():
+            # Create the directory if it doesn't exist
+            path.mkdir(parents=True, exist_ok=True)
         
-        if not selected_dir:
-            raise HTTPException(status_code=400, detail="No folder selected")
-        
-        dir_path = Path(selected_dir)
-        
-        # Verify directory exists
-        if not dir_path.exists():
-            raise HTTPException(status_code=404, detail=f"Directory not found: {dir_path}")
-        
-        if not dir_path.is_dir():
-            raise HTTPException(status_code=400, detail=f"Not a directory: {dir_path}")
-        
-        # Look for storage_metadata.json in the directory
-        metadata_file = dir_path / "storage_metadata.json"
-        if not metadata_file.exists():
+        if not path.is_dir():
             raise HTTPException(
-                status_code=404, 
-                detail=f"storage_metadata.json not found in {dir_path}. Please select the correct folder."
+                status_code=400, 
+                detail=f"Path is not a directory: {resolved_path}"
             )
         
-        path = metadata_file
-        
-        # Try to load metadata
-        _metadata_store = MetadataStore(str(path))
-        set_storage_metadata_path(str(path))
-        
-        # Create RAG directory if it doesn't exist
+        # Update the config with the new model directory
         config = get_config()
-        rag_dir = config.get_rag_directory()
-        if rag_dir:
-            rag_dir.mkdir(exist_ok=True)
+        update_config(model_directory=str(path))
         
-        # Create saved_llm directory if it doesn't exist
-        saved_llm_dir = config.get_saved_llm_directory()
-        if saved_llm_dir:
-            saved_llm_dir.mkdir(parents=True, exist_ok=True)
+        response_data = {
+            "model_directory": str(path),
+            "exists": path.exists(),
+            "is_writable": os.access(str(path), os.W_OK),
+        }
         
-        # Load existing embeddings if available
-        embedding_service = get_embedding_service()
-        embeddings_loaded = embedding_service.load_embeddings()
-        
-        # Get identified metadata properties
-        identified_properties = _metadata_store.get_identified_properties()
+        if bookmark_resolved:
+            response_data["bookmark_resolved"] = True
+            response_data["original_path"] = request.path
         
         return StatusResponse(
             status="success",
-            message=f"Storage folder set to {dir_path}",
-            data={
-                "metadata_count": len(_metadata_store.get_all_metadata()),
-                "rag_directory": str(rag_dir) if rag_dir else None,
-                "saved_llm_directory": str(saved_llm_dir) if saved_llm_dir else None,
-                "embeddings_loaded": embeddings_loaded,
-                "embeddings_count": len(embedding_service.get_all_embeddings()) if embeddings_loaded else 0,
-                "identified_properties": identified_properties,
-                "selected_folder": str(dir_path),
-                "metadata_file": str(path)
-            }
+            message=f"Model directory set to {path}",
+            data=response_data
         )
-    except HTTPException:
-        raise
+        
+    except PermissionError as e:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Permission denied: {str(e)}. Please provide a security-scoped bookmark."
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to open directory picker or load metadata: {str(e)}")
-
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Failed to set model directory: {str(e)}"
+        )
 
 @router.post("/load-rag", response_model=StatusResponse)
 async def load_rag():
@@ -1661,18 +1697,9 @@ async def chat_ws(websocket: WebSocket):
         else:
             # Use configured chat model (which could be a vision model used for text-only chat)
             chat_model = config.chat_model
-            # Check if the configured chat_model is actually a vision model
-            from app.config.settings import model_options
-            # Find if this model is a vision model in model_options
-            is_vision_model = False
-            for model_info in model_options.values():
-                if model_info.get("model_file") == chat_model and model_info.get("type") == "vision":
-                    mmproj_file = model_info.get("mmproj_file")
-                    is_vision_model = True
-                    break
-            
-            if not is_vision_model:
-                mmproj_file = None
+            # Use configured mmproj_model if set - Flutter sends the localMmprojFile 
+            # (unique prefixed filename) when user selects a vision model for chat
+            mmproj_file = config.mmproj_model if config.mmproj_model else None
             use_vision = False
         
         if not user_message:

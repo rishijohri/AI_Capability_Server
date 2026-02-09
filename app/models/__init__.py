@@ -4,12 +4,14 @@ from .metadata import FileMetadata, MetadataStore
 from app.models.requests import (
     ConfigUpdateRequest,
     StorageMetadataRequest,
+    ModelDirectoryRequest,
     TagRequest,
     DescribeRequest,
     ChatMessage,
     ChatRequest,
     AvailableModelsRequest,
-    DownloadModelsRequest
+    DownloadModelsRequest,
+    SetModelOptionsRequest
 )
 from .responses import (
     ConfigResponse,
@@ -28,12 +30,14 @@ __all__ = [
     "MetadataStore",
     "ConfigUpdateRequest",
     "StorageMetadataRequest",
+    "ModelDirectoryRequest",
     "TagRequest",
     "DescribeRequest",
     "ChatMessage",
     "ChatRequest",
     "AvailableModelsRequest",
     "DownloadModelsRequest",
+    "SetModelOptionsRequest",
     "ConfigResponse",
     "StatusResponse",
     "WebSocketMessage",

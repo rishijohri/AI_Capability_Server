@@ -12,3 +12,4 @@ opencv-python>=4.8.0
 psutil>=5.9.0
 huggingface-hub>=0.20.0
 certifi>=2023.0.0
+pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'

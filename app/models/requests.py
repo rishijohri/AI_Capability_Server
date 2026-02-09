@@ -32,6 +32,19 @@ class ConfigUpdateRequest(BaseModel):
 class StorageMetadataRequest(BaseModel):
     """Request to set storage metadata path."""
     path: str = Field(..., description="Path to storage-metadata.json file")
+    bookmark: Optional[str] = Field(
+        None, 
+        description="Base64-encoded security-scoped bookmark for macOS sandbox access"
+    )
+
+
+class ModelDirectoryRequest(BaseModel):
+    """Request to set model directory path with optional bookmark for sandbox access."""
+    path: str = Field(..., description="Absolute path to model directory")
+    bookmark: Optional[str] = Field(
+        None, 
+        description="Base64-encoded minimal bookmark for macOS sandbox access"
+    )
 
 
 class TagRequest(BaseModel):
@@ -81,3 +94,29 @@ class DownloadModelsRequest(BaseModel):
         None,
         description="Custom download location (absolute path). If None, uses configured model_directory or default saved_llm location"
     )
+
+
+class ModelOptionData(BaseModel):
+    """Individual model option data from Flutter app."""
+    model_id: str = Field(..., description="Unique model identifier")
+    name: str = Field(..., description="Human-readable model name")
+    type: Literal["chat", "vision", "embedding"] = Field(..., description="Model type")
+    model_file: str = Field(..., description="Model filename (e.g., 'model.gguf')")
+    mmproj_file: Optional[str] = Field(None, description="MMProj file for vision models")
+    repo_id: str = Field(..., description="Hugging Face repository ID")
+    is_default: bool = Field(False, description="Whether this is a default bundled model")
+    llm_params: Optional[Dict[str, Any]] = Field(None, description="Custom LLM parameters")
+
+
+class SetModelOptionsRequest(BaseModel):
+    """Request to set model options from the Flutter app.
+    
+    This endpoint receives model configurations from the Flutter client,
+    which now manages persistent model options locally and syncs them
+    to the server on startup.
+    """
+    models: List[ModelOptionData] = Field(
+        ..., 
+        description="List of model options to set on the server"
+    )
+
