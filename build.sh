@@ -114,3 +114,85 @@ else
     echo "Please check the error messages above."
     exit 1
 fi
+
+# ---------------------------------------------------------------------------
+# POST-BUILD: App Store API compliance check
+# ---------------------------------------------------------------------------
+# Scan all Mach-O binaries in the .app bundle for symbols that Apple flags
+# as non-public / deprecated APIs (Guideline 2.5.1). If any are found the
+# build is marked as FAILED so we catch the issue before submission.
+# ---------------------------------------------------------------------------
+echo ""
+echo "============================================================"
+echo "Running App Store API compliance scan..."
+echo "============================================================"
+
+FLAGGED_SYMBOLS="_lsame_|_dcabs1_|_xerbla_array__"
+APP_FRAMEWORKS="dist/visarc_ai_server.app/Contents/Frameworks"
+SCAN_FAILED=0
+
+if [ -d "$APP_FRAMEWORKS" ]; then
+    # Scan all .so and .dylib files (excluding the shim itself)
+    violations=$(find "$APP_FRAMEWORKS" \( -name "*.so" -o -name "*.dylib" \) \
+        ! -name "libscipy_blas_shim.dylib" \
+        -exec nm {} + 2>/dev/null \
+        | grep -E "$FLAGGED_SYMBOLS" || true)
+
+    if [ -n "$violations" ]; then
+        SCAN_FAILED=1
+        echo ""
+        echo "❌ FLAGGED SYMBOLS FOUND in .app bundle:"
+        echo ""
+        # Show which files contain which symbols
+        find "$APP_FRAMEWORKS" \( -name "*.so" -o -name "*.dylib" \) \
+            ! -name "libscipy_blas_shim.dylib" -print0 | while IFS= read -r -d '' so_file; do
+            hits=$(nm "$so_file" 2>/dev/null | grep -E "$FLAGGED_SYMBOLS" || true)
+            if [ -n "$hits" ]; then
+                rel_path="${so_file#dist/visarc_ai_server.app/}"
+                echo "  $rel_path"
+                echo "$hits" | while read -r line; do
+                    sym=$(echo "$line" | awk '{print $NF}')
+                    echo "    • $sym"
+                done
+            fi
+        done
+    else
+        echo "✅ No flagged symbols (_lsame_, _dcabs1_, _xerbla_array__) found"
+    fi
+
+    # Also verify the shim dylib is present and re-exports Accelerate
+    if [ -f "$APP_FRAMEWORKS/libscipy_blas_shim.dylib" ]; then
+        has_reexport=$(otool -L "$APP_FRAMEWORKS/libscipy_blas_shim.dylib" 2>/dev/null | grep -c "reexport" || true)
+        if [ "$has_reexport" -gt 0 ]; then
+            echo "✅ Shim dylib present and re-exports Accelerate"
+        else
+            echo "⚠️  Shim dylib exists but does NOT re-export Accelerate"
+            SCAN_FAILED=1
+        fi
+    else
+        echo "⚠️  Shim dylib (libscipy_blas_shim.dylib) not found in Frameworks"
+    fi
+
+    # Verify renamed symbols are resolving to the shim
+    renamed_count=$(find "$APP_FRAMEWORKS" -name "*.so" -exec nm {} + 2>/dev/null \
+        | grep -cE '_lsamZ_|_dcabZ1_|_xerblZ_array__' || true)
+    echo "✅ Found $renamed_count renamed symbol references (lsamZ/dcabZ1/xerblZ)"
+else
+    echo "⚠️  .app bundle not found at $APP_FRAMEWORKS — skipping scan"
+fi
+
+echo ""
+if [ "$SCAN_FAILED" -eq 1 ]; then
+    echo "============================================================"
+    echo "❌ API COMPLIANCE CHECK FAILED"
+    echo "============================================================"
+    echo ""
+    echo "The build contains symbols that Apple will reject."
+    echo "The post-build symbol patching in ai_capability.spec may have failed."
+    echo "Check the PyInstaller output above for [SPEC] warnings."
+    exit 1
+else
+    echo "============================================================"
+    echo "✅ API compliance check passed — ready for submission"
+    echo "============================================================"
+fi

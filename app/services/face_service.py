@@ -12,7 +12,15 @@ import base64
 try:
     from insightface.app import FaceAnalysis
     INSIGHTFACE_AVAILABLE = True
-except ImportError:
+except ImportError as e:
+    import traceback
+    print(f"[FaceService] WARNING: Failed to import InsightFace: {e}")
+    traceback.print_exc()
+    INSIGHTFACE_AVAILABLE = False
+except Exception as e:
+    import traceback
+    print(f"[FaceService] WARNING: Unexpected error importing InsightFace: {e}")
+    traceback.print_exc()
     INSIGHTFACE_AVAILABLE = False
 
 from app.config import get_config

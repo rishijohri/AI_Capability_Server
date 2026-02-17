@@ -17,6 +17,7 @@ Or use a build script:
 
 import sys
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_all, collect_submodules, collect_data_files
 
 # Get project root
 project_root = Path(SPECPATH)
@@ -69,6 +70,15 @@ if model_dir.exists():
                 dest_dir = 'model' / rel_path.parent
                 datas.append((str(src_path), str(dest_dir)))
 
+# Collect all insightface and onnxruntime submodules, data files, and binaries
+# This ensures PyInstaller bundles the complete packages (hidden imports,
+# data files like images/.pkl, and compiled .so/.dylib/.pyd files).
+_if_datas, _if_binaries, _if_hiddenimports = collect_all('insightface')
+_ort_datas, _ort_binaries, _ort_hiddenimports = collect_all('onnxruntime')
+
+datas += _if_datas + _ort_datas
+binaries += _if_binaries + _ort_binaries
+
 # Hidden imports that PyInstaller might miss
 hiddenimports = [
     'uvicorn.logging',
@@ -85,17 +95,7 @@ hiddenimports = [
     'multipart',
     'pydantic',
     'fastapi',
-    'insightface',
-    'insightface.app',
-    'insightface.app.face_analysis',
-    'insightface.model_zoo',
-    'insightface.model_zoo.landmark',
-    'insightface.utils',
-    'insightface.utils.transform',
-    'onnxruntime',
-    'onnxruntime.capi',
-    'onnxruntime.capi.onnxruntime_pybind11_state',
-]
+] + _if_hiddenimports + _ort_hiddenimports
 
 # Analysis
 a = Analysis(

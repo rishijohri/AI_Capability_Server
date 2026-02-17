@@ -17,6 +17,7 @@ Or use the build script:
 import sys
 import os
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_all, collect_submodules, collect_data_files
 
 # Get project root
 project_root = Path(SPECPATH)
@@ -83,6 +84,16 @@ except Exception as e:
     traceback.print_exc()
 
 
+# Collect all insightface, onnxruntime, and cv2 submodules, data files, and binaries
+# This ensures PyInstaller bundles the complete packages (hidden imports,
+# data files like images/.pkl, and compiled .so/.dylib files).
+_if_datas, _if_binaries, _if_hiddenimports = collect_all('insightface')
+_ort_datas, _ort_binaries, _ort_hiddenimports = collect_all('onnxruntime')
+_cv2_datas, _cv2_binaries, _cv2_hiddenimports = collect_all('cv2')
+
+datas += _if_datas + _ort_datas + _cv2_datas
+binaries += _if_binaries + _ort_binaries + _cv2_binaries
+
 # Hidden imports that PyInstaller might miss
 hiddenimports = [
     'uvicorn.logging',
@@ -99,25 +110,18 @@ hiddenimports = [
     'multipart',
     'pydantic',
     'fastapi',
-    'insightface',
-    'insightface.app',
-    'insightface.app.face_analysis',
-    'insightface.model_zoo',
-    'insightface.model_zoo.landmark',
-    'insightface.utils',
-    'insightface.utils.transform',
-    'onnxruntime',
-    'onnxruntime.capi',
-    'onnxruntime.capi.onnxruntime_pybind11_state',
     # SSL certificate management for HTTPS in sandbox
     'certifi',
     'ssl',
-]
+    # OpenCV - ensure all submodules are bundled for insightface
+    'cv2',
+] + _if_hiddenimports + _ort_hiddenimports + _cv2_hiddenimports
 
 # Exclude modules that contain non-public/deprecated macOS APIs.
 # NOTE: All scipy modules (cython_blas, cython_lapack, _propack) are KEPT because
 # they are required at runtime. Their offending symbols (_lsame_, _dcabs1_,
-# _xerbla_array__) are stripped post-build using nmedit (see bottom of spec).
+# _xerbla_array__) are binary-patched post-build to use renamed symbols and
+# redirected from Accelerate to a shim dylib (see bottom of spec).
 excludes = [
     # Tk/Tcl - not needed for headless server, contains private macOS APIs
     'tkinter',
@@ -135,7 +139,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=['hook-ssl-certifi.py'],  # Configure SSL before any imports
+    runtime_hooks=['hook-cv2-fix.py', 'hook-ssl-certifi.py'],  # Fix cv2 recursion, then configure SSL
     excludes=excludes,
     noarchive=False,
     optimize=0,
@@ -143,7 +147,7 @@ a = Analysis(
 
 # Filter out Tk/Tcl frameworks from collected binaries.
 # These contain non-public macOS API symbols that cause App Store rejection.
-# NOTE: scipy binaries are kept — their offending symbols are stripped post-build.
+# NOTE: scipy binaries are kept — their offending symbols are binary-patched post-build.
 _blocked_patterns = (
     'Tk', 'Tcl', 'tkinter', '_tkinter', 'tcl8', 'tk8',
 )
@@ -218,68 +222,137 @@ app = BUNDLE(
 )
 
 # ---------------------------------------------------------------------------
-# POST-BUILD: Strip non-public API symbols from scipy .so files
+# POST-BUILD: Patch non-public API symbols in scipy .so files
 # ---------------------------------------------------------------------------
-# Apple's App Store scanner flags standard FORTRAN BLAS/LAPACK symbols
-# (_lsame_, _dcabs1_, _xerbla_array__) as "non-public APIs" because they
-# collide with internal Apple symbol names. These are false positives —
-# they're standard LAPACK helpers compiled into scipy's Cython extensions.
+# Apple's App Store scanner flags certain LAPACK/BLAS symbol REFERENCES
+# (_lsame_, _dcabs1_, _xerbla_array__) in scipy's .so files as "non-public
+# APIs" because those names collide with internal Accelerate symbols.
 #
-# We use macOS `nmedit` to localise (hide) these symbols so they no longer
-# appear in the export table, which satisfies the App Store scanner while
-# keeping the .so files fully functional (the symbols are only called
-# internally within each shared object).
+# These symbols are UNDEFINED references (type 'U' in nm output) — the .so
+# files import them from Apple's Accelerate framework. The previous nmedit
+# approach cannot work because nmedit only operates on DEFINED symbols.
+#
+# Solution:
+#   1. Build a shim dylib (libscipy_blas_shim.dylib) that re-exports
+#      Accelerate and additionally defines renamed versions of the three
+#      flagged functions (lsamZ_, dcabZ1_, xerblZ_array__).
+#   2. Binary-patch the .so files to reference the renamed symbol names
+#      (same byte length, so all offsets stay valid).
+#   3. Use install_name_tool to redirect each .so's Accelerate link to
+#      the shim dylib (which re-exports everything else from Accelerate).
+#   4. Ad-hoc re-sign everything.
 # ---------------------------------------------------------------------------
-import subprocess, tempfile, glob as _glob
+import subprocess, shutil, glob as _glob
 
 _dist_dir = os.path.join(DISTPATH, 'visarc_ai_server')
 _app_dir = os.path.join(DISTPATH, 'visarc_ai_server.app', 'Contents', 'Frameworks')
+_shim_src = os.path.join(str(project_root), 'scipy_blas_shim.c')
+_shim_name = 'libscipy_blas_shim.dylib'
 
-# Map of .so file glob patterns → symbols to hide
-_strip_targets = {
-    'scipy/linalg/cython_blas*.so': ['_dcabs1_', '_lsame_'],
-    'scipy/linalg/cython_lapack*.so': ['_xerbla_array__'],
-    'scipy/sparse/linalg/_propack/_cpropack*.so': ['_lsame_'],
-    'scipy/sparse/linalg/_propack/_dpropack*.so': ['_lsame_'],
-    'scipy/sparse/linalg/_propack/_spropack*.so': ['_lsame_'],
-    'scipy/sparse/linalg/_propack/_zpropack*.so': ['_lsame_'],
+# Symbol rename map: original bytes → replacement bytes (MUST be same length)
+_SYMBOL_RENAMES = {
+    b'_lsame_\x00':          b'_lsamZ_\x00',          # 8 bytes
+    b'_dcabs1_\x00':         b'_dcabZ1_\x00',         # 9 bytes
+    b'_xerbla_array__\x00':  b'_xerblZ_array__\x00',  # 16 bytes
 }
 
-def _strip_symbols(base_dir):
-    """Use nmedit -R to make listed symbols local/private in .so files."""
+# .so files that need patching (glob patterns relative to base_dir)
+_PATCH_TARGETS = [
+    'scipy/linalg/cython_blas*.so',
+    'scipy/linalg/cython_lapack*.so',
+    'scipy/sparse/linalg/_propack/_cpropack*.so',
+    'scipy/sparse/linalg/_propack/_dpropack*.so',
+    'scipy/sparse/linalg/_propack/_spropack*.so',
+    'scipy/sparse/linalg/_propack/_zpropack*.so',
+]
+
+_ACCELERATE_PATH = '/System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate'
+
+def _build_shim_dylib(output_path):
+    """Compile scipy_blas_shim.c into a dylib that re-exports Accelerate."""
+    if not Path(_shim_src).exists():
+        print(f'[SPEC] ERROR: {_shim_src} not found — cannot build shim dylib')
+        return False
+    install_name = f'@executable_path/../Frameworks/{_shim_name}'
+    result = subprocess.run([
+        'clang', '-dynamiclib',
+        '-o', output_path,
+        _shim_src,
+        '-Wl,-reexport_framework,Accelerate',
+        '-install_name', install_name,
+        '-arch', 'arm64',
+        '-mmacosx-version-min=11.0',
+    ], capture_output=True, text=True)
+    if result.returncode == 0:
+        print(f'[SPEC] Built shim dylib: {output_path}')
+        return True
+    else:
+        print(f'[SPEC] ERROR: Failed to build shim dylib: {result.stderr}')
+        return False
+
+def _binary_patch_symbols(so_path):
+    """Replace flagged symbol name bytes in a .so file with renamed versions."""
+    data = Path(so_path).read_bytes()
+    original = data
+    patched_syms = []
+    for old_bytes, new_bytes in _SYMBOL_RENAMES.items():
+        if old_bytes in data:
+            data = data.replace(old_bytes, new_bytes)
+            patched_syms.append(old_bytes.rstrip(b'\x00').decode())
+    if data != original:
+        Path(so_path).write_bytes(data)
+        print(f'[SPEC] Patched symbols {patched_syms} in {os.path.basename(so_path)}')
+        return True
+    return False
+
+def _redirect_accelerate_to_shim(so_path):
+    """Change the Accelerate load command to point to our shim dylib."""
+    shim_install_name = f'@executable_path/../Frameworks/{_shim_name}'
+    result = subprocess.run([
+        'install_name_tool', '-change',
+        _ACCELERATE_PATH, shim_install_name,
+        so_path,
+    ], capture_output=True, text=True)
+    if result.returncode == 0:
+        print(f'[SPEC] Redirected Accelerate → shim in {os.path.basename(so_path)}')
+    else:
+        print(f'[SPEC] WARNING: install_name_tool failed on {so_path}: {result.stderr.strip()}')
+
+def _patch_scipy_in_dir(base_dir, shim_dylib_path):
+    """Patch all scipy .so files in base_dir and install the shim dylib."""
     if not Path(base_dir).exists():
         return
-    for pattern, symbols in _strip_targets.items():
+    # Copy shim dylib into the base directory
+    dest_shim = os.path.join(base_dir, _shim_name)
+    shutil.copy2(shim_dylib_path, dest_shim)
+    print(f'[SPEC] Installed shim dylib at {dest_shim}')
+    # Patch each target .so
+    for pattern in _PATCH_TARGETS:
         matches = _glob.glob(os.path.join(base_dir, pattern))
         for so_path in matches:
-            # Write symbol list to a temp file for nmedit -R
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-                for sym in symbols:
-                    f.write(sym + '\n')
-                sym_file = f.name
-            try:
-                result = subprocess.run(
-                    ['nmedit', '-R', sym_file, so_path],
-                    capture_output=True, text=True
-                )
-                if result.returncode == 0:
-                    print(f'[SPEC] Stripped symbols {symbols} from {so_path}')
-                else:
-                    print(f'[SPEC] WARNING: nmedit failed on {so_path}: {result.stderr}')
-            except FileNotFoundError:
-                print('[SPEC] WARNING: nmedit not found — cannot strip symbols')
-                break
-            finally:
-                os.unlink(sym_file)
+            _binary_patch_symbols(so_path)
+            _redirect_accelerate_to_shim(so_path)
 
-print('[SPEC] Post-build: stripping non-public API symbols from scipy binaries...')
-_strip_symbols(_dist_dir)
-_strip_symbols(_app_dir)
+# --- Build the shim dylib ---
+import tempfile as _tempfile
+_shim_build_dir = _tempfile.mkdtemp(prefix='scipy_shim_')
+_shim_dylib_path = os.path.join(_shim_build_dir, _shim_name)
+
+print('[SPEC] Post-build: building scipy BLAS shim dylib...')
+if _build_shim_dylib(_shim_dylib_path):
+    print('[SPEC] Post-build: patching scipy .so files (binary rename + redirect)...')
+    _patch_scipy_in_dir(_dist_dir, _shim_dylib_path)
+    _patch_scipy_in_dir(_app_dir, _shim_dylib_path)
+else:
+    print('[SPEC] ERROR: Shim dylib build failed — scipy symbols NOT patched!')
+
+# Clean up temp build directory
+shutil.rmtree(_shim_build_dir, ignore_errors=True)
 
 # ---------------------------------------------------------------------------
-# POST-BUILD: Re-sign binaries after nmedit modification
+# POST-BUILD: Re-sign binaries after symbol patching
 # ---------------------------------------------------------------------------
-# nmedit invalidates the ad-hoc code signatures that PyInstaller applied.
+# Binary patching and install_name_tool invalidate code signatures.
 # macOS (Ventura+) enforces signature validity for all Mach-O files inside
 # an .app bundle — including when spawning subprocesses like llama-server.
 # If any binary in the bundle has a broken signature, subprocess spawning
@@ -342,6 +415,6 @@ def _adhoc_resign_app(app_path):
     else:
         print(f'[SPEC] WARNING: ad-hoc sign of .app failed: {result.stderr.strip()}')
 
-print('[SPEC] Post-build: re-signing binaries after nmedit modifications...')
+print('[SPEC] Post-build: re-signing binaries after symbol patching...')
 _adhoc_resign(_dist_dir)
 _adhoc_resign_app(os.path.join(DISTPATH, 'visarc_ai_server.app'))
