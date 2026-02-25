@@ -62,6 +62,12 @@ class FAISSVectorDB(VectorDB):
     def search(self, query_vector: np.ndarray, k: int) -> Tuple[List[str], List[float]]:
         """Search for k nearest neighbors."""
         query_vector = query_vector.astype('float32').reshape(1, -1)
+        if query_vector.shape[1] != self.dimension:
+            raise ValueError(
+                f"Embedding dimension mismatch: query has {query_vector.shape[1]} dimensions "
+                f"but FAISS index expects {self.dimension}. "
+                f"Rebuild the RAG with the current embedding model."
+            )
         distances, indices = self.index.search(query_vector, k)
         
         result_ids = [self.id_map[idx] for idx in indices[0] if idx < len(self.id_map)]

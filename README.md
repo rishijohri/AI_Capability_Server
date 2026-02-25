@@ -64,6 +64,7 @@ See **[WINDOWS_SUPPORT.md](WINDOWS_SUPPORT.md)** for detailed cross-platform inf
 - ✅ **Embedding Generation** - LLM-powered embedding creation
 - ✅ **Vision Processing** - Image/video tagging and description
 - ✅ **Chat with Context** - Conversational AI with RAG integration
+- ✅ **Deep Chat** - Multi-round thinking with RAG function access
 - ✅ **WebSocket Support** - Real-time progress and streaming
 - ✅ **Modular Architecture** - Easy component replacement
 
@@ -173,6 +174,7 @@ All Python dependencies are installed in the virtual environment:
 | `/api/tag` | WebSocket | Tag images/videos |
 | `/api/describe` | WebSocket | Describe images/videos |
 | `/api/chat` | WebSocket | Chat with RAG context |
+| `/api/deep-chat` | WebSocket | Multi-round thinking chat |
 
 ## 🔧 Configuration
 

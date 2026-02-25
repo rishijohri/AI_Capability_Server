@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 import io
 import base64
+import pypdfium2 as pdfium
 
 
 class ImageProcessor:
@@ -110,6 +111,112 @@ class ImageProcessor:
             return None
     
     @staticmethod
+    def render_pdf_page(
+        pdf_path: Path,
+        page_num: int = 0,
+        dpi: int = 150,
+        scale: float = 1.0
+    ) -> Optional[bytes]:
+        """
+        Render a PDF page as a JPEG image.
+        
+        Args:
+            pdf_path: Path to the PDF file
+            page_num: Page number to render (0-indexed)
+            dpi: Resolution for rendering
+            scale: Scale multiplier for final image dimensions
+            
+        Returns:
+            Page rendered as JPEG bytes, or None if rendering fails
+        """
+        try:
+            pdf = pdfium.PdfDocument(str(pdf_path))
+            
+            # Clamp page_num to valid range
+            page_count = len(pdf)
+            if page_num < 0:
+                page_num = 0
+            elif page_num >= page_count:
+                page_num = page_count - 1
+            
+            page = pdf[page_num]
+            
+            # Render at specified DPI
+            render_scale = dpi / 72.0
+            bitmap = page.render(scale=render_scale)
+            img = bitmap.to_pil()
+            pdf.close()
+            
+            # Convert to RGB if needed (pypdfium2 may return RGBA)
+            if img.mode == 'RGBA':
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                background.paste(img, mask=img.split()[3])
+                img = background
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            # Apply scale if less than 1.0
+            if scale < 1.0:
+                new_width = max(int(img.width * scale), 1)
+                new_height = max(int(img.height * scale), 1)
+                if (new_width, new_height) != (img.width, img.height):
+                    img = img.resize((new_width, new_height), Image.LANCZOS)
+            
+            # Save as JPEG
+            buffer = io.BytesIO()
+            img.save(buffer, format='JPEG', quality=85)
+            return buffer.getvalue()
+            
+        except Exception as e:
+            print(f"Error rendering PDF page: {e}")
+            return None
+    
+    @staticmethod
+    def get_pdf_dimensions(pdf_path: Path, page_num: int = 0) -> Tuple[int, int]:
+        """
+        Get dimensions of a PDF page in points.
+        
+        Args:
+            pdf_path: Path to the PDF file
+            page_num: Page number (0-indexed)
+            
+        Returns:
+            Tuple of (width, height) in points
+        """
+        try:
+            pdf = pdfium.PdfDocument(str(pdf_path))
+            page_count = len(pdf)
+            if page_num < 0:
+                page_num = 0
+            elif page_num >= page_count:
+                page_num = page_count - 1
+            page = pdf[page_num]
+            width, height = page.get_size()
+            pdf.close()
+            return (int(width), int(height))
+        except Exception:
+            return (0, 0)
+    
+    @staticmethod
+    def get_pdf_page_count(pdf_path: Path) -> int:
+        """
+        Get the number of pages in a PDF.
+        
+        Args:
+            pdf_path: Path to the PDF file
+            
+        Returns:
+            Number of pages, or 0 if the file cannot be read
+        """
+        try:
+            pdf = pdfium.PdfDocument(str(pdf_path))
+            count = len(pdf)
+            pdf.close()
+            return count
+        except Exception:
+            return 0
+    
+    @staticmethod
     async def load_image_as_base64(
         image_name: str,
         metadata_store,
@@ -141,8 +248,36 @@ class ImageProcessor:
             return None, f"Image file not found: {image_name}"
         
         try:
-            # Resize image according to scale
-            image_bytes = ImageProcessor.resize_image_with_quality(image_path, scale)
+            file_type = image_metadata.type if hasattr(image_metadata, 'type') else "image"
+            
+            if file_type == "pdf":
+                from app.config import get_config
+                pdf_config = get_config()
+                image_bytes = ImageProcessor.render_pdf_page(
+                    image_path,
+                    page_num=pdf_config.pdf_page,
+                    dpi=pdf_config.pdf_dpi,
+                    scale=scale
+                )
+                if image_bytes is None:
+                    return None, f"Failed to render PDF: {image_name}"
+            elif file_type == "video":
+                image_bytes = ImageProcessor.extract_video_frame(image_path)
+                if image_bytes is None:
+                    return None, f"Failed to extract video frame: {image_name}"
+                # Apply scale if needed
+                if scale < 1.0:
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                        tmp.write(image_bytes)
+                        tmp_path = Path(tmp.name)
+                    try:
+                        image_bytes = ImageProcessor.resize_image_with_quality(tmp_path, scale)
+                    finally:
+                        tmp_path.unlink()
+            else:
+                # Standard image processing
+                image_bytes = ImageProcessor.resize_image_with_quality(image_path, scale)
             
             # Convert to base64
             image_base64 = base64.b64encode(image_bytes).decode('utf-8')
@@ -150,4 +285,4 @@ class ImageProcessor:
             return image_base64, None
             
         except Exception as e:
-            return None, f"Could not load image {image_name}: {str(e)}"
+            return None, f"Could not load file {image_name}: {str(e)}"

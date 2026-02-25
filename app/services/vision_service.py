@@ -169,7 +169,7 @@ class VisionService:
         
         Args:
             file_path: Path to file
-            file_type: "image" or "video"
+            file_type: "image", "video", or "pdf"
             
         Returns:
             Image bytes in JPEG format
@@ -198,6 +198,17 @@ class VisionService:
                 finally:
                     tmp_path.unlink()
             
+            return image_bytes
+        elif file_type == "pdf":
+            # Render PDF page as image
+            image_bytes = self.image_processor.render_pdf_page(
+                file_path,
+                page_num=config.pdf_page,
+                dpi=config.pdf_dpi,
+                scale=scale
+            )
+            if image_bytes is None:
+                raise ValueError(f"Failed to render PDF page: {file_path}")
             return image_bytes
         else:
             # Process image directly
@@ -295,11 +306,11 @@ class VisionService:
     
     def _get_original_dimensions(self, file_path: Path, file_type: str) -> tuple[int, int]:
         """
-        Get original dimensions of image or video frame.
+        Get original dimensions of image, video frame, or PDF page.
         
         Args:
             file_path: Path to file
-            file_type: "image" or "video"
+            file_type: "image", "video", or "pdf"
             
         Returns:
             Tuple of (width, height)
@@ -317,6 +328,10 @@ class VisionService:
             except:
                 pass
             return (0, 0)
+        elif file_type == "pdf":
+            # For PDF, get page dimensions
+            config = get_config()
+            return self.image_processor.get_pdf_dimensions(file_path, page_num=config.pdf_page)
         else:
             # For image, get dimensions directly
             return self.image_processor.get_image_dimensions(file_path)

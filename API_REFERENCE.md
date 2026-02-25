@@ -79,6 +79,7 @@ The `fileName` field in `storage_metadata.json` should contain only the filename
 | `/api/tag` | WebSocket | Generate tags for media |
 | `/api/describe` | WebSocket | Generate descriptions for media |
 | `/api/chat` | WebSocket | Chat with RAG context |
+| `/api/deep-chat` | WebSocket | Multi-round thinking chat with RAG function access |
 | `/api/cloud-chat` | WebSocket | Get RAG context for external cloud LLM |
 
 ---
@@ -1977,6 +1978,272 @@ Invalid history role:
 - Uses RAG to provide context from your files
 - Returns relevant files with similarity scores
 - Supports both text and visual conversations (when `enable_visual_chat` is enabled)
+
+---
+
+### WS /api/deep-chat
+
+Interactive chat with multi-round thinking and RAG function access. The LLM can perform multiple rounds of internal reasoning and has access to functions that allow querying both media RAG and conversation fact RAG. For the client, this endpoint acts the same as `/api/chat`.
+
+**Important:** Each WebSocket connection handles a **single request-response cycle**. The connection automatically closes after the response is complete. For follow-up questions, initiate a new WebSocket connection and provide the conversation history via the `history` parameter.
+
+**Connection:** `ws://localhost:8000/api/deep-chat`
+
+**Key Features:**
+- **Initial context gathering**: Automatic limited RAG search (top 3 media files, 500 tokens of facts) before Round 1
+- **Multi-round thinking**: The LLM performs `chat_rounds` iterations of internal reasoning (configurable via `/api/config`)
+- **Enhanced system prompt**: Uses a specialized "Deep Thinking mode" prompt that strongly encourages function usage
+- **RAG function calling**: In each round, the LLM can call functions to:
+  - `query_media_rag(query, k)`: Search media files (images, videos, etc.) with custom queries
+  - `query_fact_rag(query, k)`: Search conversation history for relevant facts with custom queries
+- **Transparent to client**: The client sees only the final response, not intermediate thinking rounds
+- **Same interface as /api/chat**: Request and response format is identical to `/api/chat`
+
+**How This Differs from Regular Chat:**
+
+| Aspect | `/api/chat` | `/api/deep-chat` |
+|--------|-------------|------------------|
+| Initial RAG | Full automatic search | Limited automatic search (baseline) |
+| Additional RAG | None | LLM-controlled function calls |
+| System Prompt | Standard chat prompt | Deep thinking prompt (encourages function use) |
+| LLM Control | No control over RAG | Full control via function calls |
+
+**1. Client Connects**
+
+**2. Server Loads Models:**
+```json
+{
+  "type": "status",
+  "message": "Loading RAG database..."
+}
+```
+
+```json
+{
+  "type": "status",
+  "message": "Loading embedding model embeddinggemma-300M-Q8_0.gguf..."
+}
+```
+
+```json
+{
+  "type": "status",
+  "message": "Loading chat model Qwen3-8B-Q4_K_M.gguf..."
+}
+```
+
+```json
+{
+  "type": "status",
+  "message": "Deep Chat ready. Send your message."
+}
+```
+
+**3. Client Sends Message:**
+
+The request format is identical to `/api/chat`:
+
+```json
+{
+  "message": "What beach photos do I have and when were they taken?",
+  "history": []
+}
+```
+
+**Message Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `message` | string | ✅ | The current user message to process |
+| `history` | array | ❌ | Optional chat history in OpenAI format |
+| `image_name` | string | ❌ | Optional image filename for visual conversations |
+
+**4. Server Gathers Initial Context:**
+
+Before thinking rounds begin, the server automatically performs a limited RAG search:
+
+```json
+{
+  "type": "status",
+  "message": "Gathering initial context..."
+}
+```
+
+```json
+{
+  "type": "status",
+  "message": "Initial context gathered from 2 source(s)"
+}
+```
+
+**Initial Context Includes:**
+- Top 3 media files from media RAG
+- Up to 500 tokens from fact RAG (conversation history)
+
+This gives the LLM baseline information before Round 1.
+
+**5. Server Performs Multi-Round Thinking:**
+
+The server sends status updates for each thinking round:
+
+```json
+{
+  "type": "status",
+  "message": "Starting deep thinking (3 rounds)..."
+}
+```
+
+```json
+{
+  "type": "status",
+  "message": "Thinking round 1/3..."
+}
+```
+
+During each round, the LLM can:
+1. Review initial context (Round 1 only) and previous round results
+2. Analyze the user's question with available information
+3. Call `query_media_rag(query, k)` with custom search queries for more specific files
+4. Call `query_fact_rag(query, k)` with custom queries for historical information
+5. Synthesize information from all sources
+6. Decide to continue thinking or provide final answer
+
+The LLM uses a **Deep Thinking mode system prompt** that encourages:
+- Using functions to gather comprehensive information
+- Making multiple targeted queries
+- Step-by-step reasoning
+- Only answering when fully informed
+
+```json
+{
+  "type": "status",
+  "message": "Thinking round 2/3..."
+}
+```
+
+```json
+{
+  "type": "status",
+  "message": "Thinking round 3/3..."
+}
+```
+
+**6. Server Streams Final Response:**
+
+Once the LLM determines it has gathered enough information, it provides the final answer:
+
+```json
+{
+  "type": "status",
+  "message": "Generating response..."
+}
+```
+
+Progress messages stream the final response:
+
+```json
+{
+  "type": "progress",
+  "message": "You have",
+  "data": {
+    "partial_response": "You have"
+  }
+}
+```
+
+```json
+{
+  "type": "progress",
+  "message": " 12 beach photos",
+  "data": {
+    "partial_response": "You have 12 beach photos"
+  }
+}
+```
+
+**6. Server Returns Result:**
+
+```json
+{
+  "type": "result",
+  "message": "Response complete",
+  "data": {
+    "response": "You have 12 beach photos in your collection, taken between June and August 2024...",
+    "thinking_rounds": 2,
+    "relevant_files": []
+  }
+}
+```
+
+**Result Data:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `response` | string | The final generated response |
+| `thinking_rounds` | int | Number of thinking rounds actually used (may be less than `chat_rounds` if LLM finished early) |
+| `relevant_files` | array | List of relevant filenames (currently empty, may be populated in future versions) |
+
+**7. Connection Closes Automatically**
+
+**How It Works Internally:**
+
+1. **Initial Gathering**: Server automatically searches RAG (limited results for baseline context)
+
+2. **Round 1**: LLM receives the question + initial context, then decides:
+   - Call `query_media_rag("beach photos summer 2024", k=10)` for comprehensive file list
+   - Call `query_fact_rag("beach vacation 2024", k=5)` for conversation history
+   
+3. **Round 2**: LLM receives function results and can:
+   - Analyze the retrieved information
+   - Make additional targeted function calls if needed (e.g., specific date ranges)
+   - Provide final answer if sufficient information is available
+
+4. **Round 3** (if needed): LLM synthesizes all information and provides final answer
+
+The LLM automatically stops thinking when it's ready to answer, so it may use fewer rounds than the configured `chat_rounds`.
+
+**Configuration:**
+
+The number of thinking rounds is controlled by the `chat_rounds` parameter in the config:
+
+```bash
+curl -X POST http://localhost:8000/api/config \
+  -H "Content-Type: application/json" \
+  -d '{"chat_rounds": 5}'
+```
+
+**Benefits over /api/chat:**
+
+1. **Initial context + on-demand queries**: Gets baseline info automatically, then LLM can dive deeper
+2. **Better information gathering**: Can query both media and fact RAGs with custom search terms
+3. **Multi-step reasoning**: Can analyze results and make follow-up queries
+4. **More comprehensive answers**: Synthesizes information from multiple targeted sources
+5. **LLM-controlled search**: The AI decides what to search for and when
+6. **Specialized prompting**: Deep thinking mode encourages thorough investigation
+7. **Configurable depth**: Adjust `chat_rounds` based on query complexity
+
+**When to Use:**
+
+- **Use `/api/deep-chat`** for complex questions requiring multi-step reasoning or multiple information sources
+- **Use `/api/chat`** for simple questions where single-pass RAG search is sufficient
+
+**Error Cases:**
+
+Same error handling as `/api/chat`:
+
+```json
+{
+  "type": "error",
+  "message": "No message provided"
+}
+```
+
+```json
+{
+  "type": "error",
+  "message": "Deep chat error: <error details>"
+}
+```
 
 ---
 

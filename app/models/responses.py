@@ -42,7 +42,7 @@ class StatusResponse(BaseModel):
 
 class WebSocketMessage(BaseModel):
     """WebSocket message format."""
-    type: Literal["status", "progress", "result", "error", "confirmation_needed", "thinking", "conclusion", "files"]
+    type: Literal["status", "progress", "result", "error", "confirmation_needed", "thinking", "conclusion", "files", "full_response"]
     message: str
     data: Optional[Dict[str, Any]] = None
     

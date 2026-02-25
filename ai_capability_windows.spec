@@ -76,8 +76,13 @@ if model_dir.exists():
 _if_datas, _if_binaries, _if_hiddenimports = collect_all('insightface')
 _ort_datas, _ort_binaries, _ort_hiddenimports = collect_all('onnxruntime')
 
-datas += _if_datas + _ort_datas
-binaries += _if_binaries + _ort_binaries
+# Collect spaCy, thinc, and the en_core_web_sm model so NLP works at runtime
+_spacy_datas, _spacy_binaries, _spacy_hiddenimports = collect_all('spacy')
+_thinc_datas, _thinc_binaries, _thinc_hiddenimports = collect_all('thinc')
+_encoresm_datas, _encoresm_binaries, _encoresm_hiddenimports = collect_all('en_core_web_sm')
+
+datas += _if_datas + _ort_datas + _spacy_datas + _thinc_datas + _encoresm_datas
+binaries += _if_binaries + _ort_binaries + _spacy_binaries + _thinc_binaries + _encoresm_binaries
 
 # Hidden imports that PyInstaller might miss
 hiddenimports = [
@@ -95,7 +100,11 @@ hiddenimports = [
     'multipart',
     'pydantic',
     'fastapi',
-] + _if_hiddenimports + _ort_hiddenimports
+    # spaCy NLP pipeline + en_core_web_sm model
+    'spacy',
+    'thinc',
+    'en_core_web_sm',
+] + _if_hiddenimports + _ort_hiddenimports + _spacy_hiddenimports + _thinc_hiddenimports + _encoresm_hiddenimports
 
 # Analysis
 a = Analysis(
