@@ -2878,11 +2878,14 @@ async def kill_server():
         async def shutdown():
             await asyncio.sleep(0.5)  # Give time for response to be sent
             
-            # Kill any remaining llama processes
+            # Kill any remaining llama processes (cross-platform, no console popups)
             try:
-                os.system("pkill -9 llama-server")
-                os.system("pkill -9 llama-cli")
-                os.system("pkill -9 llama")
+                from app.utils import get_process_manager
+                pm = get_process_manager()
+                await pm.kill_existing_binary_processes("llama-server")
+                await pm.kill_existing_binary_processes("llama-cli")
+                await pm.kill_existing_binary_processes("llama-mtmd-cli")
+                await pm.kill_existing_binary_processes("llama-embedding")
             except:
                 pass
             

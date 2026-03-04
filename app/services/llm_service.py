@@ -4,6 +4,8 @@ from typing import List, Dict, Any, Optional, AsyncGenerator
 from pathlib import Path
 import asyncio
 import json
+import platform
+import subprocess
 import aiohttp
 from abc import ABC, abstractmethod
 
@@ -12,6 +14,23 @@ from app.utils import get_process_manager
 
 # Global lock to ensure only one model is active at a time
 _model_lock = asyncio.Lock()
+
+# On Windows, suppress console window popups for spawned subprocesses.
+# CREATE_NO_WINDOW prevents console creation; STARTUPINFO+SW_HIDE hides
+# any window the child process may try to show.
+# IMPORTANT: Returns a FRESH STARTUPINFO each call because subprocess.Popen
+# mutates the object in-place (adds STARTF_USESTDHANDLES, sets pipe handles).
+def _win_subprocess_kwargs() -> Dict[str, Any]:
+    """Return kwargs for subprocess creation that suppress console windows on Windows."""
+    if platform.system() != "Windows":
+        return {}
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = subprocess.SW_HIDE
+    return {
+        "creationflags": subprocess.CREATE_NO_WINDOW,
+        "startupinfo": si,
+    }
 
 
 class LLMBackend(ABC):
@@ -454,7 +473,8 @@ class LlamaCLIBackend(LLMBackend):
             self._current_process = await asyncio.create_subprocess_exec(
                 *command,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
+                **_win_subprocess_kwargs()
             )
             process = self._current_process
         
@@ -496,7 +516,8 @@ class LlamaCLIBackend(LLMBackend):
             self._current_process = await asyncio.create_subprocess_exec(
                 *command,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
+                **_win_subprocess_kwargs()
             )
             process = self._current_process
         
@@ -619,7 +640,8 @@ class LlamaCLIBackend(LLMBackend):
                 self._current_process = await asyncio.create_subprocess_exec(
                     *command,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
+                    stderr=asyncio.subprocess.PIPE,
+                    **_win_subprocess_kwargs()
                 )
                 process = self._current_process
             

@@ -38,6 +38,17 @@ class ProcessManager:
         # Kill existing process with same name
         await self.kill_process(name)
         
+        # On Windows, suppress the console window popup for spawned processes.
+        # CREATE_NO_WINDOW prevents console creation; STARTUPINFO+SW_HIDE hides
+        # any window the child process may try to show.
+        kwargs: Dict[str, Any] = {}
+        if platform.system() == "Windows":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            kwargs["startupinfo"] = startupinfo
+
         # Start new process
         process = subprocess.Popen(
             command,
@@ -45,7 +56,8 @@ class ProcessManager:
             stderr=subprocess.PIPE,
             cwd=cwd,
             env=env,
-            text=True
+            text=True,
+            **kwargs
         )
         
         self.active_processes[name] = process
