@@ -43,10 +43,11 @@ if binary_dir.exists():
     if llama_binaries_dir.exists():
         for config_dir in llama_binaries_dir.iterdir():
             if config_dir.is_dir():
-                # Collect all files in each configuration directory
-                for binary_file in config_dir.iterdir():
-                    if binary_file.is_file():
-                        # Preserve directory structure: binary/llama_binaries/[config]/[binary]
+                # Recursively collect all files in each configuration directory
+                for root, dirs, files in config_dir.walk():
+                    for file in files:
+                        binary_file = root / file
+                        # Preserve directory structure: binary/llama_binaries/[config]/[...]/[binary]
                         rel_path = binary_file.relative_to(binary_dir)
                         dest_dir = 'binary' / rel_path.parent
                         datas.append((str(binary_file), str(dest_dir)))
@@ -151,12 +152,12 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,  # CRITICAL: Must be True for folder-based distribution
-    name='ai_capability_server',
+    name='visarc_ai_server',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=True,  # Show console window
+    console=False,  # No console window; Flutter app pipes stdout/stderr to keep process alive
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
@@ -166,8 +167,8 @@ exe = EXE(
 )
 
 # COLLECT - Bundles everything into a folder
-# This creates dist/ai_capability_server/ directory with:
-#   - ai_capability_server.exe (Windows executable)
+# This creates dist/visarc_ai_server/ directory with:
+#   - visarc_ai_server.exe (Windows executable)
 #   - binary/ (llama .exe binaries)
 #   - model/ (model files)
 #   - All Python dependencies and DLLs
@@ -178,5 +179,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='ai_capability_server',
+    name='visarc_ai_server',
 )

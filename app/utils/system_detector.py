@@ -6,6 +6,14 @@ from typing import Optional, Dict, List
 from pathlib import Path
 
 
+def _win_startupinfo() -> subprocess.STARTUPINFO:
+    """Return a STARTUPINFO that hides the child process window on Windows."""
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = subprocess.SW_HIDE
+    return si
+
+
 class SystemDetector:
     """Detect system properties and select appropriate binary configuration."""
     
@@ -51,7 +59,9 @@ class SystemDetector:
                     ["wmic", "path", "win32_VideoController", "get", "name"],
                     capture_output=True,
                     text=True,
-                    timeout=5
+                    timeout=5,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    startupinfo=_win_startupinfo()
                 )
                 gpu_info = result.stdout.lower()
                 

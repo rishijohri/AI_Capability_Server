@@ -88,21 +88,21 @@ echo.
 pyinstaller --clean ai_capability_windows.spec
 
 REM Check if build was successful
-if exist "dist\ai_capability_server\ai_capability_server.exe" (
+if exist "dist\visarc_ai_server\visarc_ai_server.exe" (
     echo.
     echo ============================================================
     echo [SUCCESS] Build successful!
     echo ============================================================
     echo.
-    echo Output location: dist\ai_capability_server\
+    echo Output location: dist\visarc_ai_server\
     echo.
     echo To run the application:
-    echo   cd dist\ai_capability_server
-    echo   ai_capability_server.exe
+    echo   cd dist\visarc_ai_server
+    echo   visarc_ai_server.exe
     echo.
     echo To distribute:
     echo   cd dist
-    echo   tar -a -c -f ai_capability_server.zip ai_capability_server
+    echo   tar -a -c -f visarc_ai_server.zip visarc_ai_server
     echo   ^(or use Windows Explorer to create a ZIP file^)
     echo.
 ) else (

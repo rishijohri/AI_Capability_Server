@@ -50,24 +50,36 @@ if (-not (Test-Path "model")) {
     exit 1
 }
 
-# Count files
-$binaryCount = (Get-ChildItem -Path "binary" -File).Count
-$modelCount = (Get-ChildItem -Path "model" -Filter "*.gguf" -File).Count
+# Count files (search recursively for platform-specific subdirectories)
+$binaryCount = (Get-ChildItem -Path "binary" -Filter "*.exe" -File -Recurse -ErrorAction SilentlyContinue).Count
+$dllCount = (Get-ChildItem -Path "binary" -Filter "*.dll" -File -Recurse -ErrorAction SilentlyContinue).Count
+$modelCount = (Get-ChildItem -Path "model" -Filter "*.gguf" -File -ErrorAction SilentlyContinue).Count
 
-Write-Host "✅ Found $binaryCount binaries in binary\" -ForegroundColor Green
+Write-Host "✅ Found $binaryCount .exe binaries in binary\" -ForegroundColor Green
+Write-Host "✅ Found $dllCount .dll files in binary\" -ForegroundColor Green
 Write-Host "✅ Found $modelCount model files in model\" -ForegroundColor Green
 
-# Check if we have .exe files
-$exeCount = (Get-ChildItem -Path "binary" -Filter "*.exe" -File).Count
-if ($exeCount -eq 0) {
+# Check if we have .exe files (recursively, including llama_binaries subdirectories)
+if ($binaryCount -eq 0) {
     Write-Host ""
-    Write-Host "⚠️  WARNING: No .exe files found in binary\" -ForegroundColor Yellow
-    Write-Host "   Windows requires .exe binaries (llama-server.exe, llama-cli.exe, etc.)" -ForegroundColor Yellow
+    Write-Host "⚠️  WARNING: No .exe files found in binary\ (searched recursively)" -ForegroundColor Yellow
+    Write-Host "   Expected structure: binary\llama_binaries\llama-win-cpu-x64\llama-server.exe" -ForegroundColor Yellow
     Write-Host ""
     $response = Read-Host "Continue anyway? (y/n)"
     if ($response -ne "y" -and $response -ne "Y") {
         Write-Host "Build cancelled." -ForegroundColor Yellow
         exit 0
+    }
+}
+
+# Show available binary configurations
+$configDirs = Get-ChildItem -Path "binary\llama_binaries" -Directory -ErrorAction SilentlyContinue
+if ($configDirs) {
+    Write-Host ""
+    Write-Host "Available binary configurations:" -ForegroundColor Cyan
+    foreach ($dir in $configDirs) {
+        $configExeCount = (Get-ChildItem -Path $dir.FullName -Filter "*.exe" -File).Count
+        Write-Host "  - $($dir.Name) ($configExeCount executables)" -ForegroundColor White
     }
 }
 
@@ -104,25 +116,25 @@ try {
 }
 
 # Check if build was successful
-if ($buildSuccess -and (Test-Path "dist\ai_capability_server\ai_capability_server.exe")) {
+if ($buildSuccess -and (Test-Path "dist\visarc_ai_server\visarc_ai_server.exe")) {
     Write-Host ""
     Write-Host "============================================================" -ForegroundColor Green
     Write-Host "✅ Build successful!" -ForegroundColor Green
     Write-Host "============================================================" -ForegroundColor Green
     Write-Host ""
-    Write-Host "Output location: dist\ai_capability_server\" -ForegroundColor White
+    Write-Host "Output location: dist\visarc_ai_server\" -ForegroundColor White
     Write-Host ""
     Write-Host "To run the application:" -ForegroundColor Cyan
-    Write-Host "  cd dist\ai_capability_server" -ForegroundColor Yellow
-    Write-Host "  .\ai_capability_server.exe" -ForegroundColor Yellow
+    Write-Host "  cd dist\visarc_ai_server" -ForegroundColor Yellow
+    Write-Host "  .\visarc_ai_server.exe" -ForegroundColor Yellow
     Write-Host ""
     Write-Host "To distribute:" -ForegroundColor Cyan
     Write-Host "  cd dist" -ForegroundColor Yellow
-    Write-Host "  Compress-Archive -Path ai_capability_server -DestinationPath ai_capability_server.zip" -ForegroundColor Yellow
+    Write-Host "  Compress-Archive -Path visarc_ai_server -DestinationPath visarc_ai_server.zip" -ForegroundColor Yellow
     Write-Host ""
     
     # Show size
-    $distSize = (Get-ChildItem -Path "dist\ai_capability_server" -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB
+    $distSize = (Get-ChildItem -Path "dist\visarc_ai_server" -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB
     Write-Host ("Total packaged size: {0:N2} MB" -f $distSize) -ForegroundColor White
     Write-Host ""
     
