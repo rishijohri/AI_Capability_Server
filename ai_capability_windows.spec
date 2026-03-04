@@ -116,10 +116,30 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        # Tk/Tcl - not needed for headless server
+        'tkinter',
+        '_tkinter',
+        'Tkinter',
+        'turtle',
+        # spaCy components not needed (tests, unused languages)
+        'spacy.tests',  # Test files (contains App Store-prohibited URLs)
+        'spacy.lang.fa',  # Persian/Farsi language support (references hazm/sobhe.ir)
+    ],
     noarchive=False,
     optimize=0,
 )
+
+# Filter out spaCy test files and unwanted language support from collected data
+# These may contain App Store-prohibited URLs (sobhe.ir) and are not needed
+_blocked_patterns = (
+    'spacy/tests', 'spacy\\tests',  # spaCy test files (contains sobhe.ir URL)
+    'spacy/lang/fa', 'spacy\\lang\\fa',  # Persian language support (references hazm)
+)
+a.binaries = [(name, path, typecode) for name, path, typecode in a.binaries
+              if not any(blocked in name or blocked in path for blocked in _blocked_patterns)]
+a.datas = [(name, path, typecode) for name, path, typecode in a.datas
+           if not any(blocked in name or blocked in path for blocked in _blocked_patterns)]
 
 # PYZ (Python zip archive)
 pyz = PYZ(a.pure)

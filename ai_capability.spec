@@ -137,6 +137,9 @@ excludes = [
     '_tkinter',
     'Tkinter',
     'turtle',
+    # spaCy components not needed (tests, unused languages)
+    'spacy.tests',  # Test files (contains App Store-prohibited URLs)
+    'spacy.lang.fa',  # Persian/Farsi language support (references hazm/sobhe.ir)
 ]
 
 # Analysis
@@ -154,11 +157,13 @@ a = Analysis(
     optimize=0,
 )
 
-# Filter out Tk/Tcl frameworks from collected binaries.
-# These contain non-public macOS API symbols that cause App Store rejection.
+# Filter out Tk/Tcl frameworks and spaCy test/unwanted files from collected binaries.
+# These contain non-public macOS API symbols or prohibited URLs that cause App Store rejection.
 # NOTE: scipy binaries are kept — their offending symbols are binary-patched post-build.
 _blocked_patterns = (
     'Tk', 'Tcl', 'tkinter', '_tkinter', 'tcl8', 'tk8',
+    'spacy/tests', 'spacy\\tests',  # spaCy test files (contains sobhe.ir URL)
+    'spacy/lang/fa', 'spacy\\lang\\fa',  # Persian language support (references hazm)
 )
 a.binaries = [(name, path, typecode) for name, path, typecode in a.binaries
               if not any(blocked in name or blocked in path for blocked in _blocked_patterns)]

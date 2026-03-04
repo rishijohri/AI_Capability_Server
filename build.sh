@@ -90,6 +90,56 @@ if [ -f "dist/visarc_ai_server/visarc_ai_server" ]; then
     echo "✅ Build successful!"
     echo "============================================================"
     echo ""
+    
+    # ---------------------------------------------------------------------------
+    # POST-BUILD: Remove App Store prohibited content
+    # ---------------------------------------------------------------------------
+    # Remove spaCy test files and Persian language support that contain
+    # the prohibited URL: http://www.sobhe.ir/hazm/
+    # This ensures App Store compliance (Guideline 2.5.1)
+    # ---------------------------------------------------------------------------
+    echo "Removing App Store prohibited content..."
+    
+    REMOVED_COUNT=0
+    
+    # Remove from both _internal and .app bundle locations
+    for base_dir in "dist/visarc_ai_server/_internal" "dist/visarc_ai_server.app/Contents/Resources"; do
+        if [ -d "$base_dir/spacy" ]; then
+            # Remove spaCy test directory (contains sobhe.ir URL in comments)
+            if [ -d "$base_dir/spacy/tests" ]; then
+                rm -rf "$base_dir/spacy/tests"
+                echo "  ✓ Removed: $base_dir/spacy/tests"
+                REMOVED_COUNT=$((REMOVED_COUNT + 1))
+            fi
+            
+            # Remove Persian (Farsi) language support (references hazm library)
+            if [ -d "$base_dir/spacy/lang/fa" ]; then
+                rm -rf "$base_dir/spacy/lang/fa"
+                echo "  ✓ Removed: $base_dir/spacy/lang/fa"
+                REMOVED_COUNT=$((REMOVED_COUNT + 1))
+            fi
+        fi
+    done
+    
+    if [ "$REMOVED_COUNT" -eq 0 ]; then
+        echo "  ℹ️  No prohibited content found (already excluded)"
+    else
+        echo "  ✅ Removed $REMOVED_COUNT prohibited content directories"
+    fi
+    
+    # Verify the URL is completely gone
+    echo ""
+    echo "Verifying URL removal..."
+    prohibited_files=$(find dist -type f \( -name "*.py" -o -name "*.pyc" \) -exec grep -l "sobhe.ir" {} \; 2>/dev/null | wc -l | tr -d ' ')
+    
+    if [ "$prohibited_files" -eq 0 ]; then
+        echo "  ✅ Confirmed: sobhe.ir URL completely removed from binary"
+    else
+        echo "  ⚠️  WARNING: Found $prohibited_files files still containing sobhe.ir"
+        find dist -type f \( -name "*.py" -o -name "*.pyc" \) -exec grep -l "sobhe.ir" {} \; 2>/dev/null | head -5
+    fi
+    echo ""
+    
     echo "Output location: dist/visarc_ai_server/"
     echo ""
     echo "To run the application:"
