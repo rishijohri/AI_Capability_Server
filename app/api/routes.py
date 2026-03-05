@@ -2064,28 +2064,31 @@ async def chat_ws(websocket: WebSocket):
             )
             sent_any = True
 
-        # If no structured tags found, send the sanitized response as a normal result
+        # If no structured tags found, wrap the raw response in conclusion/files
+        # messages so clients receive the same message sequence they expect.
         if not sent_any:
-            # Remove any remaining XML-like tags to avoid leaking internal formats
             clean_response = re.sub(r'<.*?>', '', response_sanitized, flags=re.DOTALL).strip()
             await websocket.send_json(
                 WebSocketMessage(
-                    type="result",
-                    message="Response complete",
-                    data={
-                        "response": clean_response,
-                        "relevant_files": [f.fileName for f in relevant_files]
-                    }
+                    type="conclusion",
+                    message=clean_response
                 ).to_json()
             )
-        else:
-            # Send completion status
             await websocket.send_json(
                 WebSocketMessage(
-                    type="result",
-                    message="Response complete"
+                    type="files",
+                    message="",
+                    data={"relevant_files": []}
                 ).to_json()
             )
+
+        # Send completion status
+        await websocket.send_json(
+            WebSocketMessage(
+                type="result",
+                message="Response complete"
+            ).to_json()
+        )
         
         # Unload model and close connection automatically after response
         if llm_service:
