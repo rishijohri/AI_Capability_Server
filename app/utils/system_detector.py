@@ -1,5 +1,7 @@
 """System detection utilities for automatic binary selection."""
 
+from __future__ import annotations
+
 import platform
 import subprocess
 from typing import Optional, Dict, List
