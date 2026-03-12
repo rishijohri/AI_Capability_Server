@@ -1826,6 +1826,7 @@ async def chat_ws(websocket: WebSocket):
         
         # Perform RAG search if available
         context = ""
+        relevant_files = []  # Initialize to avoid UnboundLocalError when RAG is not available
         if rag_available:
             await websocket.send_json(
                 WebSocketMessage(
