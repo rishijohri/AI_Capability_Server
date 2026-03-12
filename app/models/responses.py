@@ -8,6 +8,7 @@ class ConfigResponse(BaseModel):
     """Configuration response."""
     reduced_embedding_size: Optional[int]
     chat_rounds: int
+    chat_mode: str = Field(default="rag", description="Chat mode: 'rag' or 'mcp'")
     image_quality: float
     llm_mode: str
     top_k: int

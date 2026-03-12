@@ -44,6 +44,7 @@ from app.services import (
     get_face_service,
     get_knowledge_service
 )
+from app.services.mcp_chat_handler import run_mcp_chat
 
 router = APIRouter()
 
@@ -109,6 +110,7 @@ async def get_configuration():
     return ConfigResponse(
         reduced_embedding_size=config.reduced_embedding_size,
         chat_rounds=config.chat_rounds,
+        chat_mode=config.chat_mode,
         image_quality=config.image_quality,
         llm_mode=config.llm_mode,
         top_k=config.top_k,
@@ -144,6 +146,7 @@ async def update_configuration(request: ConfigUpdateRequest):
     return ConfigResponse(
         reduced_embedding_size=config.reduced_embedding_size,
         chat_rounds=config.chat_rounds,
+        chat_mode=config.chat_mode,
         image_quality=config.image_quality,
         llm_mode=config.llm_mode,
         top_k=config.top_k,
@@ -1824,6 +1827,86 @@ async def chat_ws(websocket: WebSocket):
             "content": user_message
         })
         
+        # ---- MCP mode branch ----
+        if config.chat_mode == "mcp":
+            # MCP mode requires server backend
+            if config.llm_mode == "cli":
+                await websocket.send_json(
+                    WebSocketMessage(
+                        type="error",
+                        message="MCP mode requires server mode (llm_mode: server). Please switch llm_mode to 'server'."
+                    ).to_json()
+                )
+                return
+            
+            # Load chat/vision model for MCP tool-calling loop
+            model_type = "vision" if use_vision else "chat"
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message=f"Loading {model_type} model {chat_model} for MCP mode..."
+                ).to_json()
+            )
+            if use_vision and mmproj_file:
+                await llm_service.load_model(chat_model, mmproj=mmproj_file)
+            else:
+                await llm_service.load_model(chat_model)
+            
+            chat_startup_cmd = llm_service.get_startup_command()
+            if chat_startup_cmd:
+                await websocket.send_json(
+                    WebSocketMessage(
+                        type="status",
+                        message=f"Chat Model Command: {chat_startup_cmd}",
+                        data={"chat_startup_command": chat_startup_cmd}
+                    ).to_json()
+                )
+                await asyncio.sleep(0.1)
+            
+            face_service = get_face_service()
+            knowledge_service = get_knowledge_service()
+            
+            await run_mcp_chat(
+                websocket=websocket,
+                user_message=user_message,
+                active_history=active_history,
+                config=config,
+                metadata_store=metadata_store,
+                rag_service=rag_service,
+                knowledge_service=knowledge_service,
+                llm_service=llm_service,
+                face_service=face_service,
+                rag_available=rag_available,
+                embedding_loaded=embedding_loaded,
+                use_vision=use_vision,
+                image_base64=image_base64,
+                image_tags=image_tags,
+                image_description=image_description,
+                chat_model=chat_model,
+                mmproj_file=mmproj_file,
+            )
+            
+            # Shared cleanup: unload model
+            if llm_service:
+                await llm_service.unload_model()
+            
+            # Store objective facts (same as RAG mode)
+            if config.enable_knowledge_storage:
+                try:
+                    knowledge_service = get_knowledge_service()
+                    knowledge_service._objectivity_threshold = config.objectivity_threshold
+                    user_obj, user_score = knowledge_service.should_store(user_message)
+                    if user_obj:
+                        knowledge_service.add_fact(
+                            user_message, "user", user_score,
+                            embedding=None,
+                        )
+                except Exception as e:
+                    print(f"Knowledge storage error (non-fatal): {e}")
+            
+            return
+        
+        # ---- RAG mode (default) ----
         # Perform RAG search if available
         context = ""
         relevant_files = []  # Initialize to avoid UnboundLocalError when RAG is not available

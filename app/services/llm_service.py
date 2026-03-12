@@ -56,6 +56,20 @@ class LLMBackend(ABC):
         """Generate response from LLM."""
         pass
     
+    async def generate_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        tool_choice: str = "auto",
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Generate response with OpenAI-format tool calling.
+        
+        Returns the full choices[0].message dict which may contain
+        'content', 'tool_calls', or both.
+        """
+        raise NotImplementedError("Tool calling not supported by this backend")
+    
     @abstractmethod
     async def embed(self, text: str) -> List[float]:
         """Generate embedding for text."""
@@ -250,6 +264,55 @@ class LlamaServerBackend(LLMBackend):
                     if "choices" in data and len(data["choices"]) > 0:
                         content = data["choices"][0]["message"]["content"]
                         yield content
+    
+    async def generate_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        tool_choice: str = "auto",
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Generate response with OpenAI-format tool calling via llama-server.
+        
+        Non-streaming — tool call responses are structured JSON.
+        Returns the full choices[0].message dict.
+        """
+        if not self.is_running():
+            raise RuntimeError("Llama-server is not running")
+        
+        config = get_config()
+        
+        payload = {
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": tool_choice,
+            "stream": False,
+            "temperature": config.llm_params.temp,
+            "top_p": config.llm_params.top_p,
+            "top_k": config.llm_params.top_k,
+            "presence_penalty": config.llm_params.presence_penalty,
+            "mirostat": config.llm_params.mirostat,
+            **kwargs
+        }
+        
+        timeout = aiohttp.ClientTimeout(total=300)
+        
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                f"{self.base_url}/v1/chat/completions",
+                json=payload
+            ) as response:
+                data = await response.json()
+                if "error" in data:
+                    error_msg = data.get("error", {})
+                    if isinstance(error_msg, dict):
+                        error_text = error_msg.get("message", str(error_msg))
+                    else:
+                        error_text = str(error_msg)
+                    raise RuntimeError(f"Llama-server tool calling error: {error_text}")
+                if "choices" in data and len(data["choices"]) > 0:
+                    return data["choices"][0]["message"]
+                raise RuntimeError(f"Unexpected tool calling response: {data}")
     
     async def embed(self, text: str) -> List[float]:
         """Generate embedding using llama-server."""
@@ -756,6 +819,19 @@ class LLMService:
         
         async for chunk in self.current_backend.generate(messages, stream, **kwargs):
             yield chunk
+    
+    async def generate_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        tool_choice: str = "auto",
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Generate response with tool calling from current model."""
+        if not self.current_backend:
+            raise RuntimeError("No model loaded")
+        
+        return await self.current_backend.generate_with_tools(messages, tools, tool_choice, **kwargs)
     
     async def embed(self, text: str) -> List[float]:
         """Generate embedding from current model."""

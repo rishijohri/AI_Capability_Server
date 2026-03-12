@@ -8,6 +8,7 @@ class ConfigUpdateRequest(BaseModel):
     """Request to update configuration."""
     reduced_embedding_size: Optional[int] = None
     chat_rounds: Optional[int] = None
+    chat_mode: Optional[Literal["rag", "mcp"]] = None
     image_quality: Optional[float] = Field(None, ge=0.0, le=1.0, description="Image scale multiplier (0.0-1.0)")
     llm_mode: Optional[Literal["server", "cli"]] = None
     top_k: Optional[int] = None
