@@ -269,6 +269,41 @@ All scripts provide:
 chmod +x binary/*
 ```
 
+### Issue: llama-server exits immediately with code 3221225781 on Windows
+
+**Error**: `RuntimeError: llama-server exited immediately with code 3221225781`
+
+**Root cause**: Exit code `3221225781` is Windows NTSTATUS `0xC0000135`
+(`STATUS_DLL_NOT_FOUND`).  The selected binary configuration (e.g.
+`llama-win-vulkan-x64`) links against GPU-runtime DLLs that are not installed
+on the machine:
+
+| Binary configuration | Required runtime |
+|----------------------|-----------------|
+| `llama-win-vulkan-*` | Vulkan runtime (`vulkan-1.dll`) — typically shipped with GPU drivers |
+| `llama-win-hip-radeon-*` | AMD ROCm / HIP runtime |
+| `llama-win-sycl-*` | Intel oneAPI / SYCL runtime |
+
+**How the application handles it automatically**: Starting with this version the
+`SystemDetector.auto_detect_config()` method validates that the preferred binary
+can actually load before selecting it.  If the GPU build fails (DLLs missing) it
+automatically falls back to `llama-win-cpu-*`, which has no external DLL
+requirements.
+
+**Manual resolution** (if the automatic fallback is insufficient):
+
+1. **Install GPU runtime drivers** (recommended for GPU acceleration):
+   - NVIDIA / AMD / Intel: install or update your GPU drivers; they typically
+     include the required runtime DLLs.
+   - Vulkan: install the [Vulkan Runtime](https://vulkan.lunarg.com/sdk/home)
+     from LunarG if your driver does not include it.
+
+2. **Place only the CPU binary configuration** in `binary/llama_binaries/` so
+   the system has no GPU builds to fall back from.
+
+3. **Force CPU configuration manually** via the `/config` API endpoint or by
+   setting `binary_config` to `llama-win-cpu-x64` before starting the service.
+
 ### Issue: Process Won't Start on Windows
 
 **Problem**: Process fails to start with no error
