@@ -56,17 +56,36 @@ class SystemDetector:
         
         elif system == "windows":
             try:
-                # Try to detect AMD GPU (for HIP)
-                result = subprocess.run(
-                    ["wmic", "path", "win32_VideoController", "get", "name"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                    startupinfo=_win_startupinfo()
-                )
-                gpu_info = result.stdout.lower()
-                
+                gpu_info = ""
+
+                # Primary: PowerShell Get-CimInstance (modern replacement for wmic)
+                try:
+                    result = subprocess.run(
+                        ["powershell", "-NoProfile", "-NoLogo", "-Command",
+                         "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"],
+                        capture_output=True, text=True, timeout=3,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                        startupinfo=_win_startupinfo()
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        gpu_info = result.stdout.lower()
+                except Exception:
+                    pass
+
+                # Fallback: wmic for older systems without PowerShell
+                if not gpu_info:
+                    try:
+                        result = subprocess.run(
+                            ["wmic", "path", "win32_VideoController", "get", "name"],
+                            capture_output=True, text=True, timeout=3,
+                            creationflags=subprocess.CREATE_NO_WINDOW,
+                            startupinfo=_win_startupinfo()
+                        )
+                        if result.returncode == 0 and result.stdout.strip():
+                            gpu_info = result.stdout.lower()
+                    except Exception:
+                        pass
+
                 if "amd" in gpu_info or "radeon" in gpu_info:
                     return "hip-radeon"
                 elif "intel" in gpu_info and "arc" in gpu_info:

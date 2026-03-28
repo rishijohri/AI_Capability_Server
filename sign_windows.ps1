@@ -109,22 +109,42 @@ if ($allFiles.Count -eq 0) {
 }
 
 # ─── Sign files ───────────────────────────────────────────────────────────────
+# WDAC/Smart App Control blocks ALL unsigned executables and DLLs, including
+# numpy .pyd modules, scipy DLLs, etc. Sign everything unconditionally.
+# Batch files into single signtool calls for performance (shared timestamp).
 
 Write-Host "Signing files..." -ForegroundColor Yellow
 $signed = 0
 $failed = 0
 $failedFiles = @()
 
-foreach ($file in $allFiles) {
-    $result = & $signtool.FullName sign /f $CertPath /p $CertPassword /fd SHA256 /tr $TimestampServer /td SHA256 $file.FullName 2>&1
+# Batch files into groups for faster signing (signtool accepts multiple files)
+$batchSize = 50
+for ($i = 0; $i -lt $allFiles.Count; $i += $batchSize) {
+    $batch = $allFiles[$i..[math]::Min($i + $batchSize - 1, $allFiles.Count - 1)]
+    $filePaths = $batch | ForEach-Object { $_.FullName }
+    
+    $result = & $signtool.FullName sign /f $CertPath /p $CertPassword /fd SHA256 /tr $TimestampServer /td SHA256 $filePaths 2>&1
     if ($LASTEXITCODE -eq 0) {
-        $signed++
+        $signed += $filePaths.Count
     } else {
-        $failed++
-        $failedFiles += $file.FullName
-        Write-Host "  FAILED: $($file.Name)" -ForegroundColor Red
+        # Retry individually to identify which files failed
+        foreach ($file in $batch) {
+            $result = & $signtool.FullName sign /f $CertPath /p $CertPassword /fd SHA256 /tr $TimestampServer /td SHA256 $file.FullName 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                $signed++
+            } else {
+                $failed++
+                $failedFiles += $file.FullName
+            }
+        }
     }
+    
+    # Progress indicator
+    $pct = [math]::Min(100, [math]::Round(($i + $batch.Count) / $allFiles.Count * 100))
+    Write-Host "`r  Progress: $pct% ($($signed + $failed) / $($allFiles.Count))" -NoNewline -ForegroundColor DarkGray
 }
+Write-Host ""
 
 Write-Host ""
 
