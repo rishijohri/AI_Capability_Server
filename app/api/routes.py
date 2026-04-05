@@ -44,7 +44,7 @@ from app.services import (
     get_face_service,
     get_knowledge_service
 )
-from app.services.mcp_chat_handler import run_mcp_chat
+
 
 router = APIRouter()
 
@@ -110,7 +110,7 @@ async def get_configuration():
     return ConfigResponse(
         reduced_embedding_size=config.reduced_embedding_size,
         chat_rounds=config.chat_rounds,
-        chat_mode=config.chat_mode,
+
         image_quality=config.image_quality,
         llm_mode=config.llm_mode,
         top_k=config.top_k,
@@ -146,7 +146,7 @@ async def update_configuration(request: ConfigUpdateRequest):
     return ConfigResponse(
         reduced_embedding_size=config.reduced_embedding_size,
         chat_rounds=config.chat_rounds,
-        chat_mode=config.chat_mode,
+
         image_quality=config.image_quality,
         llm_mode=config.llm_mode,
         top_k=config.top_k,
@@ -1827,84 +1827,7 @@ async def chat_ws(websocket: WebSocket):
             "content": user_message
         })
         
-        # ---- MCP mode branch ----
-        if config.chat_mode == "mcp":
-            # MCP mode requires server backend
-            if config.llm_mode == "cli":
-                await websocket.send_json(
-                    WebSocketMessage(
-                        type="error",
-                        message="MCP mode requires server mode (llm_mode: server). Please switch llm_mode to 'server'."
-                    ).to_json()
-                )
-                return
-            
-            # Load chat/vision model for MCP tool-calling loop
-            model_type = "vision" if use_vision else "chat"
-            await websocket.send_json(
-                WebSocketMessage(
-                    type="status",
-                    message=f"Loading {model_type} model {chat_model} for MCP mode..."
-                ).to_json()
-            )
-            if use_vision and mmproj_file:
-                await llm_service.load_model(chat_model, mmproj=mmproj_file)
-            else:
-                await llm_service.load_model(chat_model)
-            
-            chat_startup_cmd = llm_service.get_startup_command()
-            if chat_startup_cmd:
-                await websocket.send_json(
-                    WebSocketMessage(
-                        type="status",
-                        message=f"Chat Model Command: {chat_startup_cmd}",
-                        data={"chat_startup_command": chat_startup_cmd}
-                    ).to_json()
-                )
-                await asyncio.sleep(0.1)
-            
-            face_service = get_face_service()
-            knowledge_service = get_knowledge_service()
-            
-            await run_mcp_chat(
-                websocket=websocket,
-                user_message=user_message,
-                active_history=active_history,
-                config=config,
-                metadata_store=metadata_store,
-                rag_service=rag_service,
-                knowledge_service=knowledge_service,
-                llm_service=llm_service,
-                face_service=face_service,
-                rag_available=rag_available,
-                embedding_loaded=embedding_loaded,
-                use_vision=use_vision,
-                image_base64=image_base64,
-                image_tags=image_tags,
-                image_description=image_description,
-                chat_model=chat_model,
-                mmproj_file=mmproj_file,
-            )
-            
-            # Shared cleanup: unload model
-            if llm_service:
-                await llm_service.unload_model()
-            
-            # Store objective facts (same as RAG mode)
-            if config.enable_knowledge_storage:
-                try:
-                    knowledge_service = get_knowledge_service()
-                    knowledge_service._objectivity_threshold = config.objectivity_threshold
-                    user_obj, user_score = knowledge_service.should_store(user_message)
-                    if user_obj:
-                        knowledge_service.add_fact(
-                            user_message, "user", user_score,
-                            embedding=None,
-                        )
-                except Exception as e:
-                    print(f"Knowledge storage error (non-fatal): {e}")
-            
-            return
+
         
         # ---- RAG mode (default) ----
         # Perform RAG search if available
@@ -2472,18 +2395,18 @@ async def cloud_chat_ws(websocket: WebSocket):
 @router.websocket("/deep-chat")
 async def deep_chat_ws(websocket: WebSocket):
     """
-    Deep Chat WebSocket endpoint with multi-round thinking and RAG access.
+    Deep Chat WebSocket endpoint with agentic ReAct tool-calling loop.
     
-    The LLM can perform multiple rounds of thinking and has access to functions
-    that allow querying both media RAG and fact RAG. For the client calling this
-    websocket, it acts the same as the normal chat websocket API.
+    The LLM autonomously calls tools (search media, search knowledge, etc.)
+    via llama-server's native OpenAI-compatible tool-calling API across
+    multiple rounds to gather information before providing a final answer.
     
+    Requires llm_mode: server (tool calling needs llama-server).
     Number of rounds is controlled by the chat_rounds config parameter.
     """
     await websocket.accept()
     
     # Track if we should cleanup on disconnect
-    generation_task = None
     llm_service = None
     
     try:
@@ -2494,10 +2417,37 @@ async def deep_chat_ws(websocket: WebSocket):
         knowledge_service = get_knowledge_service()
         metadata_store = get_metadata_store()
         
-        # Prepare chat session (load RAG and embedding models)
-        rag_available, embedding_loaded = await chat_helpers.prepare_chat_session(
-            websocket, metadata_store
-        )
+        # Deep chat requires server mode for tool calling
+        if config.llm_mode == "cli":
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="error",
+                    message="Deep Chat requires server mode (llm_mode: server). Tool calling needs llama-server."
+                ).to_json()
+            )
+            return
+        
+        # Deep chat: lightweight session prep (no embedding model at startup)
+        # The orchestrator handles model swapping during worker execution
+        rag_service = get_rag_service()
+        knowledge_service = get_knowledge_service()
+        
+        # Check if metadata file has been updated
+        if await metadata_store.reload_if_modified():
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message="Storage metadata reloaded."
+                ).to_json()
+            )
+        
+        # Load RAG index if available (no embedding model needed yet)
+        rag_available = rag_service.is_loaded()
+        if not rag_available:
+            load_result = rag_service.load_rag(metadata_store)
+            rag_available = isinstance(load_result, dict) and load_result.get("success", False)
+        
+        embedding_loaded = False  # Embedding model loaded on-demand by workers
         
         await websocket.send_json(
             WebSocketMessage(
@@ -2514,14 +2464,11 @@ async def deep_chat_ws(websocket: WebSocket):
         provided_history = msg_data.get("history")  # Optional chat history (OpenAI format)
         
         # Determine which model to use
-        if config.enable_visual_chat and image_name:
-            chat_model = config.vision_model
-            mmproj_file = config.mmproj_model
-            use_vision = True
-        else:
-            chat_model = config.chat_model
-            mmproj_file = config.mmproj_model if config.mmproj_model else None
-            use_vision = False
+        # Always use chat_model for extraction/refinement; vision_model is
+        # loaded only in the synthesis step when an image is attached.
+        chat_model = config.chat_model
+        mmproj_file = config.mmproj_model if config.mmproj_model else None
+        use_vision = bool(image_name)
         
         if not user_message:
             await websocket.send_json(
@@ -2541,7 +2488,7 @@ async def deep_chat_ws(websocket: WebSocket):
         image_base64 = None
         image_tags = []
         image_description = None
-        if use_vision and image_name:
+        if image_name:
             image_base64, image_tags, image_description, error = await chat_helpers.load_image_for_chat(
                 websocket, image_name, metadata_store
             )
@@ -2554,24 +2501,17 @@ async def deep_chat_ws(websocket: WebSocket):
             "content": user_message
         })
         
-        # Gather initial context (limited initial RAG search)
-        initial_context = await chat_helpers.gather_initial_context(
-            websocket, user_message, active_history, rag_available, embedding_loaded
-        )
+        # NO initial RAG search — the LLM controls all data access through tools
         
-        # Now load the chat model for generation
-        model_type = "vision" if use_vision else "chat"
+        # Load the chat model for extraction/refinement (text model, no mmproj)
         await websocket.send_json(
             WebSocketMessage(
                 type="status",
-                message=f"Loading {model_type} model {chat_model}..." + (f" with mmproj: {mmproj_file}" if use_vision and mmproj_file else "")
+                message=f"Loading chat model {chat_model}..."
             ).to_json()
         )
         
-        if use_vision and mmproj_file:
-            await llm_service.load_model(chat_model, mmproj=mmproj_file)
-        else:
-            await llm_service.load_model(chat_model)
+        await llm_service.load_model(chat_model)
         
         # Send chat model startup command
         chat_startup_cmd = llm_service.get_startup_command()
@@ -2585,286 +2525,32 @@ async def deep_chat_ws(websocket: WebSocket):
             )
             await asyncio.sleep(0.1)
         
-        # ===== DEEP CHAT MULTI-ROUND THINKING =====
-        await websocket.send_json(
-            WebSocketMessage(
-                type="status",
-                message=f"Starting deep thinking ({config.chat_rounds} rounds)..."
-            ).to_json()
-        )
+        # Run the agentic deep chat handler
+        from app.services.deep_chat_handler import run_deep_chat
         
-        # Define RAG query functions available to the LLM
-        async def query_media_rag_func(query: str, k: int = 5) -> str:
-            """Query the media RAG (images, videos, etc.) and return relevant file information."""
-            if not rag_available:
-                return "Media RAG is not available."
-            
-            try:
-                # Switch to embedding model temporarily
-                await llm_service.load_model(config.embedding_model)
-                relevant_files = await rag_service.search(query, k=k)
-                # Switch back to chat model
-                if use_vision and mmproj_file:
-                    await llm_service.load_model(chat_model, mmproj=mmproj_file)
-                else:
-                    await llm_service.load_model(chat_model)
-                
-                context, _ = chat_helpers.build_rag_context_from_results(relevant_files)
-                return context
-            except Exception as e:
-                return f"Error querying media RAG: {str(e)}"
+        face_service = get_face_service()
         
-        async def query_fact_rag_func(query: str, token_budget: int = 1000, min_relevance: float = 0.3) -> str:
-            """Query the conversation fact RAG and return relevant historical facts."""
-            if not config.enable_knowledge_storage or not knowledge_service.is_loaded():
-                return "Fact RAG is not available."
-            
-            try:
-                # Switch to embedding model temporarily
-                await llm_service.load_model(config.embedding_model)
-                query_embedding = await llm_service.embed(query)
-                # Switch back to chat model
-                if use_vision and mmproj_file:
-                    await llm_service.load_model(chat_model, mmproj=mmproj_file)
-                else:
-                    await llm_service.load_model(chat_model)
-                
-                relevant_facts = knowledge_service.select_knowledge(
-                    query_embedding,
-                    token_budget=token_budget,
-                    min_relevance=min_relevance,
-                )
-                
-                if relevant_facts:
-                    fact_lines = [f"- {f['message']}" for f in relevant_facts]
-                    return "\n".join(fact_lines)
-                else:
-                    return "No relevant facts found."
-            except Exception as e:
-                return f"Error querying fact RAG: {str(e)}"
-        
-        # Multi-round thinking loop
-        thinking_history = []
-        all_round_responses = []  # Collect raw output from every round
-        final_response = ""
-        final_files = []
-        
-        for round_num in range(config.chat_rounds):
-            await websocket.send_json(
-                WebSocketMessage(
-                    type="status",
-                    message=f"Thinking round {round_num + 1}/{config.chat_rounds}..."
-                ).to_json()
-            )
-            
-            # Build messages for this round
-            current_date = datetime.now().strftime("%B %d, %Y")
-            
-            # Prepare round context
-            round_context = f"Current Date: {current_date}\n\n"
-            
-            # Include initial context if available (only in first round)
-            if round_num == 0 and initial_context:
-                round_context += f"{initial_context}\n\n"
-            
-            if thinking_history:
-                round_context += "Previous thinking rounds:\n" + "\n".join(thinking_history) + "\n\n"
-            
-            # On the last round, inject a mandatory conclusion instruction
-            is_last_round = (round_num == config.chat_rounds - 1)
-            system_content = f"{config.deep_chat_system_prompt}\n\n{round_context}"
-            if is_last_round:
-                system_content += ("\n\n*** THIS IS YOUR FINAL ROUND. You MUST respond with "
-                                   "<conclusion>your answer</conclusion> and "
-                                   "<files>relevant files or empty</files> tags NOW. "
-                                   "Do NOT use <think> tags. Do NOT call any functions. "
-                                   "Provide your final answer immediately. ***")
-            
-            messages = [
-                {
-                    "role": "system",
-                    "content": system_content
-                }
-            ] + active_history
-            
-            # Generate response for this round
-            round_response = ""
-            
-            async def generate_round():
-                nonlocal round_response
-                try:
-                    if use_vision and image_base64:
-                        # Vision mode
-                        image_context_parts = []
-                        if image_tags:
-                            image_context_parts.append(f"Image Tags: {', '.join(image_tags)}")
-                        if image_description:
-                            image_context_parts.append(f"Image Description: {image_description}")
-                        
-                        image_context = "\n".join(image_context_parts) if image_context_parts else ""
-                        
-                        vision_system = f"{config.deep_chat_system_prompt}\n\n{current_date}\n\n{round_context}"
-                        if image_context:
-                            vision_system += f"\n\nImage Context:\n{image_context}"
-                        if is_last_round:
-                            vision_system += ("\n\n*** THIS IS YOUR FINAL ROUND. You MUST respond with "
-                                              "<conclusion>your answer</conclusion> and "
-                                              "<files>relevant files or empty</files> tags NOW. "
-                                              "Do NOT use <think> tags. Do NOT call any functions. "
-                                              "Provide your final answer immediately. ***")
-                        
-                        prompt = f"{vision_system}\n\nUser: {user_message}\n\nAssistant:"
-                        
-                        import base64
-                        image_bytes = base64.b64decode(image_base64)
-                        
-                        round_response = await llm_service.generate_vision(image_bytes, prompt, mmproj_file)
-                    else:
-                        # Text mode - streaming
-                        async for chunk in llm_service.generate(messages, stream=True):
-                            round_response += chunk
-                except asyncio.CancelledError:
-                    raise
-            
-            generation_task = asyncio.create_task(generate_round())
-            
-            try:
-                await asyncio.wait_for(generation_task, timeout=config.llm_timeout)
-            except asyncio.TimeoutError:
-                generation_task.cancel()
-                await websocket.send_json(
-                    WebSocketMessage(
-                        type="error",
-                        message=f"Response generation timed out after {config.llm_timeout} seconds"
-                    ).to_json()
-                )
-                return
-            
-            # Store raw round output
-            all_round_responses.append(f"--- Round {round_num + 1} ---\n{round_response}")
-            
-            # Parse response for completion or function calls
-            # Check for conclusion (final answer)
-            conclusion_match = re.search(r'<conclusion>(.*?)</conclusion>', round_response, re.DOTALL)
-            files_match = re.search(r'<files>(.*?)</files>', round_response, re.DOTALL)
-            
-            if conclusion_match:
-                final_response = conclusion_match.group(1).strip()
-                if files_match:
-                    files_content = files_match.group(1).strip()
-                    if files_content:
-                        # Parse file list (comma or newline separated)
-                        final_files = [f.strip().lstrip('- ') for f in re.split(r'[,\n]', files_content) if f.strip()]
-                thinking_history.append(f"Round {round_num + 1}: Reached final conclusion")
-                break
-            
-            # Extract and execute function calls
-            function_calls = re.findall(r'<function_call>(.*?)</function_call>', round_response, re.DOTALL)
-            
-            if function_calls:
-                function_results = []
-                
-                for fc in function_calls:
-                    name_match = re.search(r'<name>(.*?)</name>', fc, re.DOTALL)
-                    args_match = re.search(r'<arguments>(.*?)</arguments>', fc, re.DOTALL)
-                    
-                    if name_match and args_match:
-                        func_name = name_match.group(1).strip()
-                        args_json = args_match.group(1).strip()
-                        
-                        try:
-                            args = json.loads(args_json)
-                            
-                            if func_name == "query_media_rag":
-                                result = await query_media_rag_func(**args)
-                                function_results.append(f"query_media_rag({args}): {result}")
-                            elif func_name == "query_fact_rag":
-                                result = await query_fact_rag_func(**args)
-                                function_results.append(f"query_fact_rag({args}): {result}")
-                            else:
-                                function_results.append(f"Unknown function: {func_name}")
-                        except Exception as e:
-                            function_results.append(f"Error executing {func_name}: {str(e)}")
-                
-                # Add function results to thinking history
-                thinking_history.append(f"Round {round_num + 1}: Called {len(function_results)} function(s)")
-                
-                # Add function results to active history for next round
-                active_history.append({
-                    "role": "assistant",
-                    "content": f"Function results: {'; '.join(function_results)}"
-                })
-            else:
-                # No function calls and no conclusion - treat as intermediate thinking
-                thinking_history.append(f"Round {round_num + 1}: Thinking...")
-        
-        # Build full_response from all rounds
-        full_response_text = "\n\n".join(all_round_responses)
-        
-        # If no conclusion was found during the loop, extract from last response
-        if not final_response:
-            # Sanitize: remove any <think> blocks first
-            response_sanitized = re.sub(r'<think>.*?</think>', '', round_response, flags=re.DOTALL)
-            
-            # Try to extract conclusion
-            conclusion_match = re.search(r'<conclusion>(.*?)</conclusion>', response_sanitized, re.DOTALL)
-            files_match = re.search(r'<files>(.*?)</files>', response_sanitized, re.DOTALL)
-            
-            if conclusion_match:
-                final_response = conclusion_match.group(1).strip()
-            else:
-                # Fall back to cleaned raw text (strip remaining XML tags)
-                final_response = re.sub(r'<.*?>', '', response_sanitized, flags=re.DOTALL).strip()
-            
-            if files_match:
-                files_content = files_match.group(1).strip()
-                if files_content:
-                    parts = re.split(r'\r?\n|,', files_content)
-                    for p in parts:
-                        p = re.sub(r'^[\-*]\s*', '', p.strip())
-                        if p:
-                            final_files.append(p)
-        
-        # Send conclusion message (matching regular chat format)
-        await websocket.send_json(
-            WebSocketMessage(
-                type="conclusion",
-                message=final_response
-            ).to_json()
-        )
-        
-        # Send files message (matching regular chat format)
-        files_raw = ", ".join(final_files) if final_files else ""
-        await websocket.send_json(
-            WebSocketMessage(
-                type="files",
-                message=files_raw,
-                data={"relevant_files": final_files}
-            ).to_json()
-        )
-        
-        # Send full_response with complete raw output from all rounds
-        await websocket.send_json(
-            WebSocketMessage(
-                type="full_response",
-                message=full_response_text,
-                data={
-                    "thinking_rounds": len(thinking_history),
-                    "round_count": len(all_round_responses)
-                }
-            ).to_json()
-        )
-        
-        # Send completion
-        await websocket.send_json(
-            WebSocketMessage(
-                type="result",
-                message="Response complete",
-                data={
-                    "thinking_rounds": len(thinking_history),
-                    "relevant_files": final_files
-                }
-            ).to_json()
+        await run_deep_chat(
+            websocket=websocket,
+            user_message=user_message,
+            active_history=active_history,
+            config=config,
+            metadata_store=metadata_store,
+            rag_service=rag_service,
+            knowledge_service=knowledge_service,
+            llm_service=llm_service,
+            face_service=face_service,
+            rag_available=rag_available,
+            embedding_loaded=embedding_loaded,
+            use_vision=use_vision,
+            image_base64=image_base64,
+            image_name=image_name,
+            image_tags=image_tags,
+            image_description=image_description,
+            chat_model=chat_model,
+            vision_model=config.vision_model,
+            embedding_model=config.embedding_model,
+            mmproj_file=mmproj_file,
         )
         
         # Unload model
@@ -2879,34 +2565,12 @@ async def deep_chat_ws(websocket: WebSocket):
         )
         
     except WebSocketDisconnect:
-        if generation_task and not generation_task.done():
-            generation_task.cancel()
-            try:
-                await generation_task
-            except asyncio.CancelledError:
-                pass
-        
-        if llm_service and config.llm_mode == "cli":
-            if hasattr(llm_service.current_backend, 'cancel_generation'):
-                await llm_service.current_backend.cancel_generation()
-        
         if llm_service:
             await llm_service.unload_model()
     except asyncio.CancelledError:
-        if llm_service and config.llm_mode == "cli":
-            if hasattr(llm_service.current_backend, 'cancel_generation'):
-                await llm_service.current_backend.cancel_generation()
-        
         if llm_service:
             await llm_service.unload_model()
     except Exception as e:
-        if generation_task and not generation_task.done():
-            generation_task.cancel()
-            try:
-                await generation_task
-            except asyncio.CancelledError:
-                pass
-        
         startup_command = llm_service.get_startup_command() if llm_service else None
         
         error_details = {
@@ -2927,8 +2591,6 @@ async def deep_chat_ws(websocket: WebSocket):
         if llm_service:
             await llm_service.unload_model()
     finally:
-        if generation_task and not generation_task.done():
-            generation_task.cancel()
         await websocket.close()
 
 

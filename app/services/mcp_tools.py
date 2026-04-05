@@ -10,8 +10,8 @@ from app.models.metadata import MetadataStore
 
 logger = logging.getLogger(__name__)
 
-# Maximum characters in a tool result to protect context window
-MAX_RESULT_CHARS = 8000
+# Maximum characters in a tool result to protect context window (ctx_size ~6500)
+MAX_RESULT_CHARS = 2000
 
 
 def _truncate(text: str, limit: int = MAX_RESULT_CHARS) -> str:
@@ -48,6 +48,9 @@ class MCPToolRegistry:
         face_service=None,
         embedding_loaded: bool = False,
         rag_available: bool = False,
+        chat_model: str = "",
+        embedding_model: str = "",
+        mmproj_file: str = "",
     ):
         self.metadata_store = metadata_store
         self.rag_service = rag_service
@@ -56,6 +59,9 @@ class MCPToolRegistry:
         self.face_service = face_service
         self.embedding_loaded = embedding_loaded
         self.rag_available = rag_available
+        self.chat_model = chat_model
+        self.embedding_model = embedding_model
+        self.mmproj_file = mmproj_file
 
         # Map tool name → handler
         self._handlers = {
@@ -237,6 +243,19 @@ class MCPToolRegistry:
     # Tool implementations
     # ------------------------------------------------------------------
 
+    async def _swap_to_embedding(self) -> None:
+        """Swap to embedding model for RAG/knowledge searches."""
+        if self.llm_service and self.embedding_model:
+            await self.llm_service.load_model(self.embedding_model)
+
+    async def _restore_chat_model(self) -> None:
+        """Restore chat model after embedding search."""
+        if self.llm_service and self.chat_model:
+            if self.mmproj_file:
+                await self.llm_service.load_model(self.chat_model, mmproj=self.mmproj_file)
+            else:
+                await self.llm_service.load_model(self.chat_model)
+
     async def _search_media(self, args: Dict[str, Any]) -> str:
         query = args.get("query", "")
         count = min(int(args.get("count", 5)), 20)
@@ -244,7 +263,14 @@ class MCPToolRegistry:
         if not self.rag_service or not self.rag_available:
             return "Media search is not available (RAG not loaded)."
 
-        results = await self.rag_service.search(query, k=count)
+        # Swap to embedding model for semantic search
+        await self._swap_to_embedding()
+        try:
+            results = await self.rag_service.search(query, k=count)
+        finally:
+            # Always restore chat model
+            await self._restore_chat_model()
+
         if not results:
             return f"No files found matching '{query}'."
 
@@ -507,8 +533,13 @@ class MCPToolRegistry:
             return "LLM service is not available (needed for embedding query)."
 
         try:
-            # Generate embedding for the query
-            embedding = await self.llm_service.embed(query)
+            # Swap to embedding model for query embedding
+            await self._swap_to_embedding()
+            try:
+                embedding = await self.llm_service.embed(query)
+            finally:
+                await self._restore_chat_model()
+
             facts = self.knowledge_service.select_knowledge(
                 query_embedding=embedding,
                 token_budget=token_budget,

@@ -123,7 +123,8 @@ class LlamaServerBackend(LLMBackend):
             "--n-gpu-layers", str(config.llm_params.n_gpu_layers),
             "--port", "8100",
             "--host", "127.0.0.1",
-            "--embeddings"  # Enable embeddings support
+            "--embeddings",  # Enable embeddings support
+            "--jinja"  # Enable Jinja templates for proper tool-calling support
         ]
         
         # Add mmproj if provided
@@ -262,8 +263,12 @@ class LlamaServerBackend(LLMBackend):
                 else:
                     data = await response.json()
                     if "choices" in data and len(data["choices"]) > 0:
-                        content = data["choices"][0]["message"]["content"]
-                        yield content
+                        content = data["choices"][0]["message"].get("content", "")
+                        if content:
+                            yield content
+                    else:
+                        import logging
+                        logging.getLogger("app.services.llm_service").error(f"Generate returned no choices: {data}")
     
     async def generate_with_tools(
         self,

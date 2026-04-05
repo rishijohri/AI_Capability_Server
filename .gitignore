@@ -60,3 +60,4 @@ descoped_model/
 dist/
 macos/
 old_binary/
+storage_metadata.json
