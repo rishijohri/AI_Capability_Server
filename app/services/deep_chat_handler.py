@@ -24,12 +24,21 @@ import json
 import logging
 import re
 from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import numpy as np
 
 from app.models.responses import WebSocketMessage
 from app.models.metadata import FileMetadata
+from app.services.conversation_compaction_service import (
+    get_conversation_compaction_service,
+)
+from app.services.deep_chat_prompts import (
+    build_extraction_prompt,
+    build_refinement_prompt,
+    build_synthesis_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,20 +47,39 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 MAX_CONTEXT_FILES = 8         # Max files to feed to synthesis LLM
 MAX_INITIAL_TAGS = 200        # Tags for Call 1 (must fit in 6500 ctx with prompt + output)
-MAX_REFINEMENT_TAGS = 400     # Tags for Call 2 (filtered set is smaller, can show more)
 MAX_REFINEMENT_ROUNDS = 2     # Max LLM refinement iterations
 MAX_FILE_CONTEXT_CHARS = 400  # Per-file metadata chars in synthesis prompt
+
+
+# ---------------------------------------------------------------------------
+# ConversationCandidate — duck-typed companion to FileMetadata for tag filtering
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ConversationCandidate:
+    """Represents a compacted conversation as a filterable candidate.
+
+    Has a ``tags`` attribute so it flows through ``_filter_by_tags()`` without
+    any modification to that function.
+    """
+    conv_id: str
+    summary: str
+    tags: List[str]
+    compacted_at: str
 
 
 # ---------------------------------------------------------------------------
 # Helpers: Library context
 # ---------------------------------------------------------------------------
 
-def _get_library_tags_and_dates(metadata_store) -> Tuple[List[str], int, Tuple[str, str]]:
-    """Get all tags (sorted by frequency) and date range from the library.
+def _get_library_tags_and_dates(
+    metadata_store,
+    compaction_service=None,
+) -> Tuple[List[str], int, List[str], Tuple[str, str]]:
+    """Get tags/dates from files and (optionally) conversation keywords.
 
     Returns:
-        (top_tags, total_unique_tags, (min_date, max_date))
+        (top_file_tags, total_unique_file_tags, conv_tags, (min_date, max_date))
     """
     all_meta = metadata_store.get_all_metadata()
 
@@ -72,6 +100,14 @@ def _get_library_tags_and_dates(metadata_store) -> Tuple[List[str], int, Tuple[s
     total_unique = len(all_tags_sorted)
     top_tags = all_tags_sorted[:MAX_INITIAL_TAGS]
 
+    # Conversation keyword tags (from all compacted conversations)
+    conv_tag_counter: Counter = Counter()
+    if compaction_service is not None:
+        for entry in compaction_service.get_all_data().values():
+            for tag in entry.get("tags", []):
+                conv_tag_counter[tag.lower()] += 1
+    conv_tags = [tag for tag, _ in conv_tag_counter.most_common()]
+
     # Date range
     if dates:
         min_date = min(dates).strftime("%Y-%m-%d")
@@ -80,52 +116,23 @@ def _get_library_tags_and_dates(metadata_store) -> Tuple[List[str], int, Tuple[s
         min_date = "unknown"
         max_date = "unknown"
 
-    return top_tags, total_unique, (min_date, max_date)
+    return top_tags, total_unique, conv_tags, (min_date, max_date)
 
 
-def _get_tags_from_files(files: List[FileMetadata]) -> List[str]:
-    """Extract all unique tags from a set of files, sorted by frequency."""
+def _get_tags_from_candidates(candidates: List[Any]) -> List[str]:
+    """Extract all unique tags from a set of candidates (FileMetadata or ConversationCandidate),
+    sorted by frequency.
+    """
     tag_counter: Counter = Counter()
-    for meta in files:
-        for tag in meta.tags:
+    for c in candidates:
+        for tag in c.tags:
             tag_counter[tag.lower()] = tag_counter.get(tag.lower(), 0) + 1
     return [tag for tag, _ in tag_counter.most_common()]
 
 
 # ---------------------------------------------------------------------------
-# LLM Call 1: Initial Parameter Extraction
+# LLM Call 1 / Call 2: Parsing helpers
 # ---------------------------------------------------------------------------
-
-def _build_extraction_prompt(
-    top_tags: List[str],
-    total_tags: int,
-    date_range: Tuple[str, str],
-) -> str:
-    """Build extraction prompt with real library data."""
-    tags_str = ", ".join(top_tags)
-    omitted = total_tags - len(top_tags)
-    omitted_note = f"\n({omitted} additional less-common tags not shown)" if omitted > 0 else ""
-
-    return f"""/no_think
-Extract search parameters from the user's question about their media library.
-
-LIBRARY TAGS ({len(top_tags)} shown, {total_tags} total): {tags_str}{omitted_note}
-LIBRARY DATE RANGE: {date_range[0]} to {date_range[1]}
-
-RESPOND EXACTLY:
-FILTER_ORDER:date_first or tags_first
-START_DATE:YYYY-MM-DD
-END_DATE:YYYY-MM-DD
-TAGS:tag1,tag2,tag3
-RAG_QUERY:semantic search phrase
-
-RULES:
-- FILTER_ORDER: Choose date_first when question mentions a specific date/time. Choose tags_first when question is about a topic without specific date.
-- Dates: YYYY-MM-DD. Same date for both if asking about one day. Use none if no date mentioned.
-- TAGS: Pick from the LIBRARY TAGS above. Choose 3-10 that relate to the question topic.
-- RAG_QUERY: A descriptive search phrase to find relevant files semantically.
-- Use none if not applicable.
-- Start response with FILTER_ORDER: immediately."""
 
 
 def _parse_line_params(text: str) -> Dict[str, Any]:
@@ -139,6 +146,7 @@ def _parse_line_params(text: str) -> Dict[str, Any]:
         "tags": [],
         "rag_query": "",
         "satisfied": False,
+        "plan": "one_step",
     }
 
     for line in text.split("\n"):
@@ -169,6 +177,8 @@ def _parse_line_params(text: str) -> Dict[str, Any]:
                 result["rag_query"] = val.strip('"')
         elif key == "SATISFIED":
             result["satisfied"] = val.lower().startswith("yes")
+        elif key == "PLAN":
+            result["plan"] = "two_step" if "two" in val.lower() else "one_step"
 
     return result
 
@@ -221,46 +231,8 @@ def _fallback_extraction(question: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# LLM Call 2: Refinement
+# LLM Call 2: Refinement (prompt built via deep_chat_prompts.build_refinement_prompt)
 # ---------------------------------------------------------------------------
-
-def _build_refinement_prompt(
-    file_count: int,
-    filtered_tags: List[str],
-    total_filtered_tags: int,
-    current_params: Dict[str, Any],
-) -> str:
-    """Build refinement prompt showing tags within the filtered file set."""
-    tags_str = ", ".join(filtered_tags[:MAX_REFINEMENT_TAGS])
-    omitted = total_filtered_tags - min(len(filtered_tags), MAX_REFINEMENT_TAGS)
-    omitted_note = f"\n({omitted} additional tags not shown)" if omitted > 0 else ""
-
-    current_tags_str = ", ".join(current_params["tags"]) if current_params["tags"] else "none"
-    date_info = ""
-    if current_params["start_date"]:
-        date_info = f"Date range: {current_params['start_date']} to {current_params['end_date']}"
-    else:
-        date_info = "Date range: not specified"
-
-    return f"""/no_think
-You filtered the media library and found {file_count} files.
-{date_info}
-Current selected tags: {current_tags_str}
-
-TAGS IN FILTERED FILES ({min(len(filtered_tags), MAX_REFINEMENT_TAGS)} shown, {total_filtered_tags} total): {tags_str}{omitted_note}
-
-Are you satisfied with the current filter to answer the user's question, or do you want to adjust?
-
-RESPOND EXACTLY:
-TAGS:tag1,tag2,tag3
-RAG_QUERY:semantic search query for the topic
-SATISFIED:yes or no
-
-RULES:
-- TAGS: Pick from the TAGS IN FILTERED FILES. Choose the most relevant ones (3-10).
-- RAG_QUERY: A descriptive phrase to semantically search within the filtered files.
-- SATISFIED:yes if the file set looks good, no if you want to filter more.
-- Start response with TAGS: immediately."""
 
 
 # ---------------------------------------------------------------------------
@@ -294,103 +266,96 @@ def _filter_by_date(
 
 
 def _filter_by_tags(
-    files: List[FileMetadata],
+    candidates: List[Any],
     tags: List[str],
     min_matches: int = 1,
-) -> List[FileMetadata]:
-    """Filter files with at least min_matches matching tags. Sorted by match count."""
+) -> List[Any]:
+    """Filter candidates (FileMetadata or ConversationCandidate) with at least
+    min_matches matching tags.  Sorted descending by match count.
+    Works via duck typing — both types expose a ``tags`` attribute.
+    """
     if not tags:
-        return files
+        return candidates
 
     needles = [t.lower() for t in tags]
     scored = []
-    for meta in files:
-        meta_tags_lower = [t.lower() for t in meta.tags]
+    for c in candidates:
+        c_tags_lower = [t.lower() for t in c.tags]
         match_count = sum(
             1 for needle in needles
-            if any(needle in mt for mt in meta_tags_lower)
+            if any(needle in ct for ct in c_tags_lower)
         )
         if match_count >= min_matches:
-            scored.append((match_count, meta))
+            scored.append((match_count, c))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [meta for _, meta in scored]
-
-
-def _merge_candidates(
-    date_tag_files: List[FileMetadata],
-    date_only_files: List[FileMetadata],
-    tag_only_files: List[FileMetadata],
-    max_files: int,
-) -> List[FileMetadata]:
-    """Merge with priority: date+tags > date-only > tags-only."""
-    seen: Set[str] = set()
-    result: List[FileMetadata] = []
-
-    for source in [date_tag_files, date_only_files, tag_only_files]:
-        for meta in source:
-            if meta.fileName not in seen and len(result) < max_files:
-                seen.add(meta.fileName)
-                result.append(meta)
-    return result
-
+    return [c for _, c in scored]
 
 # ---------------------------------------------------------------------------
 # Scoped RAG: Temporary FAISS from filtered files
 # ---------------------------------------------------------------------------
 
 async def _scoped_rag_search(
-    filtered_files: List[FileMetadata],
+    filtered_candidates: List[Any],
     query: str,
     k: int,
     llm_service,
     embedding_model: str,
     metadata_store,
-) -> List[FileMetadata]:
-    """Build a temporary FAISS index from filtered files and search it.
+    compaction_service=None,
+) -> List[Any]:
+    """Build a temporary FAISS index from filtered candidates (files + conversations) and search it.
 
-    Uses existing embeddings from disk — only loads the embedding model
-    to generate the query embedding. File embeddings are NOT regenerated.
+    File embeddings are loaded from the embedding service (already on disk).
+    Conversation embeddings are loaded from the compaction service (already stored).
+    Only the query embedding is generated, so no re-embedding of candidates occurs.
     """
     try:
         import faiss
     except ImportError:
         logger.warning("FAISS not available, skipping scoped RAG")
-        return filtered_files[:k]
+        return filtered_candidates[:k]
 
     from app.services.embedding_service import get_embedding_service
     embedding_service = get_embedding_service()
 
-    # Ensure embeddings are loaded
+    # Ensure file embeddings are loaded
     if not embedding_service.embeddings:
         embedding_service.load_embeddings()
 
-    if not embedding_service.embeddings:
-        logger.warning("No embeddings available for scoped RAG")
-        return filtered_files[:k]
+    # Collect embeddings for all candidates
+    # identifier -> (embedding, candidate)
+    candidate_embeddings: List[Tuple[str, List[float], Any]] = []
 
-    # Collect embeddings for filtered files only
-    file_embeddings: List[Tuple[str, List[float]]] = []
-    for meta in filtered_files:
-        emb = embedding_service.get_embedding(meta.fileName)
-        if emb is not None:
-            file_embeddings.append((meta.fileName, emb))
+    stored_conv_embeddings = (
+        compaction_service.get_all_embeddings() if compaction_service is not None else {}
+    )
 
-    if not file_embeddings:
-        logger.warning("No embeddings found for filtered files")
-        return filtered_files[:k]
+    for c in filtered_candidates:
+        if isinstance(c, ConversationCandidate):
+            emb = stored_conv_embeddings.get(c.conv_id)
+            if emb is not None:
+                candidate_embeddings.append((f"conv:{c.conv_id}", emb, c))
+        else:
+            emb = embedding_service.get_embedding(c.fileName)
+            if emb is not None:
+                candidate_embeddings.append((c.fileName, emb, c))
+
+    if not candidate_embeddings:
+        logger.warning("No embeddings found for filtered candidates")
+        return filtered_candidates[:k]
 
     # Build temporary FAISS index
-    filenames = [fn for fn, _ in file_embeddings]
-    vectors = np.array([emb for _, emb in file_embeddings], dtype='float32')
+    identifiers = [ident for ident, _, _ in candidate_embeddings]
+    vectors = np.array([emb for _, emb, _ in candidate_embeddings], dtype='float32')
     dimension = vectors.shape[1]
 
     temp_index = faiss.IndexFlatL2(dimension)
     temp_index.add(vectors)
 
-    logger.info(f"Scoped FAISS: {len(filenames)} vectors, dim={dimension}")
+    logger.info(f"Scoped FAISS: {len(identifiers)} vectors (files+convs), dim={dimension}")
 
-    # Generate query embedding (requires embedding model)
+    # Generate query embedding
     await llm_service.load_model(embedding_model)
     query_embedding = await llm_service.embed(query)
     query_vector = np.array(query_embedding, dtype='float32').reshape(1, -1)
@@ -403,33 +368,24 @@ async def _scoped_rag_search(
         ).reshape(1, -1)
 
     # Search
-    actual_k = min(k, len(filenames))
+    actual_k = min(k, len(identifiers))
     distances, indices = temp_index.search(query_vector, actual_k)
 
-    # Map back to FileMetadata
-    results = []
+    # Map back to original candidates
+    results: List[Any] = []
     for idx in indices[0]:
-        if 0 <= idx < len(filenames):
-            fn = filenames[idx]
-            meta = metadata_store.get_metadata_by_filename(fn)
-            if meta:
-                results.append(meta)
+        if 0 <= idx < len(candidate_embeddings):
+            results.append(candidate_embeddings[idx][2])
 
-    logger.info(f"Scoped RAG returned {len(results)} files: {[r.fileName for r in results]}")
+    file_count = sum(1 for r in results if isinstance(r, FileMetadata))
+    conv_count = sum(1 for r in results if isinstance(r, ConversationCandidate))
+    logger.info(f"Scoped RAG returned {len(results)} candidates: {file_count} files, {conv_count} conversations")
     return results
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: Synthesis
+# Phase 3: Synthesis (prompts live in deep_chat_prompts.py)
 # ---------------------------------------------------------------------------
-
-SYNTHESIS_PROMPT = """/no_think
-You are Persona. Answer the user's question using ONLY the file data below.
-
-RULES:
-- Start your answer immediately. Do NOT use <think> tags.
-- Reference specific file names, dates, tags, and descriptions from the data if helpful.
-- If data is insufficient, say what you found and what's missing."""
 
 
 def _format_file_for_context(meta: FileMetadata) -> str:
@@ -447,20 +403,111 @@ def _format_file_for_context(meta: FileMetadata) -> str:
     text = "\n".join(parts)
     return text[:MAX_FILE_CONTEXT_CHARS]
 
+def _format_conversation_for_context(c: ConversationCandidate) -> str:
+    """Format a compacted conversation candidate for the synthesis prompt."""
+    parts = [f"\u2022 [Conversation {c.conv_id}]"]
+    if c.compacted_at:
+        parts.append(f"  Compacted: {c.compacted_at[:10]}")
+    if c.tags:
+        parts.append(f"  Keywords: {', '.join(c.tags[:12])}")
+    if c.summary:
+        summary_preview = c.summary[:300] + "..." if len(c.summary) > 300 else c.summary
+        parts.append(f"  Facts: {summary_preview}")
+    text = "\n".join(parts)
+    return text[:MAX_FILE_CONTEXT_CHARS]
 
-def _auto_extract_files(text: str, candidates: List[FileMetadata]) -> List[str]:
-    """Auto-extract mentioned filenames, fallback to all candidates if none explicitly mentioned."""
-    files_list = []
+
+def _format_candidate_for_context(candidate: Any) -> str:
+    """Dispatch to the appropriate formatter based on candidate type."""
+    if isinstance(candidate, ConversationCandidate):
+        return _format_conversation_for_context(candidate)
+    return _format_file_for_context(candidate)
+
+def _auto_extract_files(text: str, candidates: List[Any]) -> List[str]:
+    """Auto-extract mentioned identifiers, fallback to all candidates if none explicitly mentioned."""
+    ids_list = []
     for c in candidates:
-        if c.fileName in text:
-            files_list.append(c.fileName)
-            
-    # If the model didn't explicitly mention the filenames but answered based on them, 
-    # just return all the candidate files as the relevant set.
-    if not files_list and candidates:
-        files_list = [c.fileName for c in candidates]
-        
-    return files_list
+        identifier = c.conv_id if isinstance(c, ConversationCandidate) else c.fileName
+        if identifier in text:
+            ids_list.append(identifier)
+
+    # If the model didn't explicitly mention identifiers but answered based on context,
+    # return all candidate identifiers as the relevant set.
+    if not ids_list and candidates:
+        ids_list = [
+            c.conv_id if isinstance(c, ConversationCandidate) else c.fileName
+            for c in candidates
+        ]
+
+    return ids_list
+
+
+# ---------------------------------------------------------------------------
+# Short Extraction request parsing
+# ---------------------------------------------------------------------------
+
+def _parse_short_extraction_request(text: str) -> Optional[Dict[str, Any]]:
+    """Detect SHORT_EXTRACTION in synthesis output and extract the follow-up search params.
+
+    Returns a dict with keys (start_date, end_date, tags, rag_query) if the
+    keyword is present, otherwise None.
+    """
+    if "SHORT_EXTRACTION" not in text:
+        return None
+
+    result: Dict[str, Any] = {
+        "start_date": None,
+        "end_date": None,
+        "tags": [],
+        "rag_query": "",
+        "insight": "",
+    }
+
+    for line in text.split("\n"):
+        line = line.strip()
+        if ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        key = key.strip().upper()
+        val = val.strip()
+
+        if key == "START_DATE":
+            if val.lower() != "none" and re.match(r'\d{4}-\d{2}-\d{2}', val):
+                result["start_date"] = re.match(r'\d{4}-\d{2}-\d{2}', val).group()
+        elif key == "END_DATE":
+            if val.lower() != "none" and re.match(r'\d{4}-\d{2}-\d{2}', val):
+                result["end_date"] = re.match(r'\d{4}-\d{2}-\d{2}', val).group()
+        elif key == "TAGS":
+            if val.lower() != "none":
+                result["tags"] = [t.strip().lower() for t in val.split(",") if t.strip()]
+        elif key == "RAG_QUERY":
+            if val.lower() != "none":
+                result["rag_query"] = val.strip('"')
+        elif key == "INSIGHT":
+            if val.lower() != "none":
+                result["insight"] = val.strip('"')
+
+    return result
+
+def _strip_search_directives(text: str) -> str:
+    """Remove SHORT_EXTRACTION directive lines from synthesis output,
+    preserving the human-readable explanation text.
+    """
+    directive_prefixes = (
+        "SHORT_EXTRACTION",
+        "START_DATE:",
+        "END_DATE:",
+        "TAGS:",
+        "RAG_QUERY:",
+        "INSIGHT:",
+    )
+    clean = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if any(stripped.upper().startswith(p.upper()) for p in directive_prefixes):
+            continue
+        clean.append(line)
+    return "\n".join(clean).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +533,6 @@ async def run_deep_chat(
     config,
     metadata_store,
     rag_service,
-    knowledge_service,
     llm_service,
     face_service,
     rag_available: bool,
@@ -526,13 +572,34 @@ async def run_deep_chat(
         user_message = image_context + user_message
 
     # ------------------------------------------------------------------
-    # Get library context (tags + dates) — pure Python, fast
+    # Get library context (tags + dates) and conversation candidates
     # ------------------------------------------------------------------
-    top_tags, total_tags, date_range = _get_library_tags_and_dates(metadata_store)
+    compaction_service = get_conversation_compaction_service()
+    if not compaction_service.is_loaded():
+        compaction_service.load()
+
+    top_tags, total_tags, conv_tags, date_range = _get_library_tags_and_dates(
+        metadata_store, compaction_service
+    )
     all_meta = metadata_store.get_all_metadata()
 
-    logger.info(f"Library: {len(all_meta)} files, {total_tags} unique tags, "
-                f"dates {date_range[0]} to {date_range[1]}")
+    # Build conversation candidates from all compacted conversations
+    conversation_candidates: List[ConversationCandidate] = [
+        ConversationCandidate(
+            conv_id=cid,
+            summary=d.get("summary", ""),
+            tags=d.get("tags", []),
+            compacted_at=d.get("compactedAt", ""),
+        )
+        for cid, d in compaction_service.get_all_data().items()
+        if d.get("embedding")  # only include conversations that have been embedded
+    ]
+
+    logger.info(
+        f"Library: {len(all_meta)} files, {total_tags} unique tags, "
+        f"dates {date_range[0]} to {date_range[1]}, "
+        f"{len(conversation_candidates)} compacted conversation(s)"
+    )
 
     # ==================================================================
     # LLM CALL 1: Initial parameter extraction
@@ -541,7 +608,7 @@ async def run_deep_chat(
         WebSocketMessage(type="thinking", message="Understanding your question...").to_json()
     )
 
-    extraction_prompt = _build_extraction_prompt(top_tags, total_tags, date_range)
+    extraction_prompt = build_extraction_prompt(top_tags, total_tags, date_range, conv_tags)
     messages = [
         {"role": "system", "content": extraction_prompt},
         {"role": "user", "content": user_message},
@@ -611,18 +678,22 @@ async def run_deep_chat(
     # Working set: date-filtered if we have dates, otherwise full library
     working_set = date_filtered if date_filtered else all_meta
 
+    # Conversation candidates participate in tag filtering only (no date filter)
+    conv_working_set: List[ConversationCandidate] = list(conversation_candidates)
+
     # ==================================================================
-    # LLM CALL 2: Refinement — show tags from filtered set
+    # LLM CALL 2: Refinement — show tags from combined filtered set
     # ==================================================================
-    filtered_tags = _get_tags_from_files(working_set)
+    filtered_tags = _get_tags_from_candidates(working_set + conv_working_set)
     total_filtered_tags = len(filtered_tags)
 
     for refinement_round in range(MAX_REFINEMENT_ROUNDS):
-        refinement_prompt = _build_refinement_prompt(
+        refinement_prompt = build_refinement_prompt(
             file_count=len(working_set),
             filtered_tags=filtered_tags,
             total_filtered_tags=total_filtered_tags,
             current_params=params,
+            conv_count=len(conv_working_set),
         )
 
         ref_messages = [
@@ -666,8 +737,14 @@ async def run_deep_chat(
                 tag_filtered = _filter_by_tags(working_set, ref_params["tags"])
                 if tag_filtered:
                     working_set = tag_filtered
-                    filtered_tags = _get_tags_from_files(working_set)
-                    total_filtered_tags = len(filtered_tags)
+
+                # Apply same tags to conversation candidates (parallel lane)
+                conv_tag_filtered = _filter_by_tags(conv_working_set, ref_params["tags"])
+                if conv_tag_filtered:
+                    conv_working_set = conv_tag_filtered
+
+                filtered_tags = _get_tags_from_candidates(working_set + conv_working_set)
+                total_filtered_tags = len(filtered_tags)
 
         except Exception as e:
             logger.error(f"Refinement failed: {e}", exc_info=True)
@@ -676,9 +753,10 @@ async def run_deep_chat(
     # ==================================================================
     # PYTHON: Final filtering + optional RAG refinement
     # ==================================================================
-    # The working_set already contains the strict intersection of Date and Tag filters
-    # based on the iterative refinement. We do not mix in out-of-bounds files.
-    candidates = working_set
+    # The working_set already contains the strict intersection of Date and Tag filters.
+    # conv_working_set contains conversations that survived tag filtering.
+    # Merge both lanes before semantic ranking.
+    candidates: List[Any] = list(working_set) + list(conv_working_set)
 
     # If we have too many candidates, or we have a specific RAG query, we rank them semantically
     rag_query = params.get("rag_query", user_message)
@@ -687,17 +765,18 @@ async def run_deep_chat(
         await websocket.send_json(
             WebSocketMessage(
                 type="status",
-                message=f"Semantic ranking of {len(candidates)} filtered files..."
+                message=f"Semantic ranking of {len(working_set)} file(s) + {len(conv_working_set)} conversation(s)..."
             ).to_json()
         )
 
         candidates = await _scoped_rag_search(
-            filtered_files=candidates,
+            filtered_candidates=candidates,
             query=rag_query,
             k=MAX_CONTEXT_FILES,
             llm_service=llm_service,
             embedding_model=embedding_model,
             metadata_store=metadata_store,
+            compaction_service=compaction_service,
         )
         # Restore chat model after embedding model was used
         await llm_service.load_model(chat_model)
@@ -713,12 +792,15 @@ async def run_deep_chat(
     )
 
     # ==================================================================
-    # LLM CALL 3: Answer Synthesis
+    # LLM CALL 3+: Answer Synthesis with Short Extraction loop
     # ==================================================================
+    max_short_extractions = getattr(config, 'chat_rounds', 2)
+    remaining_extractions = max_short_extractions
+
     if candidates:
-        file_context = "\n\n".join(_format_file_for_context(m) for m in candidates)
+        file_context = "\n\n".join(_format_candidate_for_context(m) for m in candidates)
     else:
-        file_context = "No files matched the search criteria."
+        file_context = "No files or conversations matched the search criteria."
 
     # Ensure appropriate model is loaded for synthesis
     if image_name and vision_model and mmproj_file:
@@ -738,7 +820,7 @@ async def run_deep_chat(
         user_content = f"{user_message}\n\n=== FILE DATA ===\n{file_context}\n=== END ==="
 
     synthesis_messages = [
-        {"role": "system", "content": SYNTHESIS_PROMPT},
+        {"role": "system", "content": build_synthesis_prompt(remaining_extractions)},
         {"role": "user", "content": user_content},
     ]
 
@@ -761,9 +843,135 @@ async def run_deep_chat(
 
     logger.info(f"Synthesis raw ({len(full_response)} chars): {full_response[:300]}")
 
-    # The model's response continues after our "<conclusion>\n" prefill,
-    # so wrap it back for parsing
-    full_response = full_response
+    # ==================================================================
+    # Short Extraction loop
+    # ==================================================================
+    collected_insights: List[str] = []
+    for extraction_round in range(max_short_extractions):
+        se_request = _parse_short_extraction_request(full_response)
+        if not se_request:
+            break  # AI is satisfied — no further extraction needed
+
+        remaining_extractions -= 1
+        logger.info(f"Short Extraction {extraction_round + 1}/{max_short_extractions}: {se_request}")
+        await websocket.send_json(
+            WebSocketMessage(
+                type="status",
+                message=f"Short Extraction {extraction_round + 1}/{max_short_extractions}: searching for additional context..."
+            ).to_json()
+        )
+
+        # Build candidate pool with AI-requested params
+        # Conversations are exempt from date filtering — only files are date-filtered
+        se_all_meta: List[FileMetadata] = list(all_meta)
+        if se_request["start_date"] and se_request["end_date"]:
+            se_date_filtered = _filter_by_date(
+                all_meta, se_request["start_date"], se_request["end_date"]
+            )
+            if se_date_filtered:
+                se_all_meta = se_date_filtered
+                await websocket.send_json(
+                    WebSocketMessage(
+                        type="status",
+                        message=f"Short Extraction date filter: {len(se_all_meta)} file(s) "
+                                f"({se_request['start_date']} to {se_request['end_date']})"
+                    ).to_json()
+                )
+
+        se_file_candidates: List[Any] = list(se_all_meta)
+        # Conversation candidates always participate without date filtering
+        se_conv_candidates: List[ConversationCandidate] = list(conversation_candidates)
+
+        if se_request["tags"]:
+            tag_filtered_files = _filter_by_tags(se_file_candidates, se_request["tags"])
+            if tag_filtered_files:
+                se_file_candidates = tag_filtered_files
+            tag_filtered_convs = _filter_by_tags(se_conv_candidates, se_request["tags"])
+            if tag_filtered_convs:
+                se_conv_candidates = tag_filtered_convs
+
+        se_candidates: List[Any] = se_file_candidates + se_conv_candidates
+        se_query = se_request["rag_query"] or user_message
+
+        if se_candidates:
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message=f"Semantic ranking of {len(se_file_candidates)} file(s) + "
+                            f"{len(se_conv_candidates)} conversation(s)..."
+                ).to_json()
+            )
+            se_candidates = await _scoped_rag_search(
+                filtered_candidates=se_candidates,
+                query=se_query,
+                k=MAX_CONTEXT_FILES,
+                llm_service=llm_service,
+                embedding_model=embedding_model,
+                metadata_store=metadata_store,
+                compaction_service=compaction_service,
+            )
+            await llm_service.load_model(chat_model)
+
+        # Merge new results with existing candidates (dedup, cap)
+        seen_ids: Set[str] = {
+            (c.conv_id if isinstance(c, ConversationCandidate) else c.fileName)
+            for c in candidates
+        }
+        for c in se_candidates:
+            cid = c.conv_id if isinstance(c, ConversationCandidate) else c.fileName
+            if cid not in seen_ids:
+                candidates.append(c)
+                seen_ids.add(cid)
+        candidates = candidates[:MAX_CONTEXT_FILES]
+
+        # Re-synthesize with expanded data, carrying forward the insight
+        await websocket.send_json(
+            WebSocketMessage(
+                type="thinking",
+                message=f"Re-analyzing with {len(candidates)} candidate(s) "
+                        f"(extraction {extraction_round + 1}/{max_short_extractions})..."
+            ).to_json()
+        )
+
+        file_context = "\n\n".join(_format_candidate_for_context(m) for m in candidates)
+
+        # Accumulate insights across rounds
+        insight_text = se_request.get("insight", "")
+        if insight_text:
+            collected_insights.append(f"Round {extraction_round + 1}: {insight_text}")
+        insight_block = ""
+        if collected_insights:
+            insight_block = "\n\n=== INSIGHTS FROM PREVIOUS ROUNDS ===\n" + "\n".join(collected_insights) + "\n=== END INSIGHTS ==="
+
+        base_text = f"{user_message}{insight_block}\n\n=== FILE DATA ===\n{file_context}\n=== END ==="
+        if image_name and image_base64:
+            user_content = [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
+                {"type": "text", "text": base_text}
+            ]
+        else:
+            user_content = base_text
+
+        synthesis_messages = [
+            {"role": "system", "content": build_synthesis_prompt(remaining_extractions)},
+            {"role": "user", "content": user_content},
+        ]
+
+        full_response = ""
+        try:
+            async for chunk in llm_service.generate(synthesis_messages, stream=False):
+                full_response += chunk
+        except Exception as e:
+            logger.error(f"Short Extraction synthesis {extraction_round + 1} failed: {e}", exc_info=True)
+            break
+
+        logger.info(
+            f"Short Extraction {extraction_round + 1} synthesis raw "
+            f"({len(full_response)} chars): {full_response[:300]}"
+        )
+
+    # Strip any leftover directives the AI may have emitted on the final pass
+    full_response = _strip_search_directives(full_response)
 
     # Clean any leaked think/xml tags
     full_response = re.sub(r'<[^>]+>', '', full_response).strip()
@@ -774,7 +982,7 @@ async def run_deep_chat(
         logger.warning(f"Empty conclusion generated")
         conclusion = "I couldn't find enough data to answer. Try specifying a date or topic more precisely."
 
-    # Dynamically resolve file list from candidates
+    # Dynamically resolve identifier list from candidates
     files_list = _auto_extract_files(conclusion, candidates)
     
     # Always include the actively attached image if it was used in inference

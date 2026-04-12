@@ -42,7 +42,8 @@ from app.services import (
     get_rag_service,
     get_vision_service,
     get_face_service,
-    get_knowledge_service
+    get_conversation_compaction_service,
+    extract_tags_from_summary,
 )
 
 
@@ -62,45 +63,71 @@ def get_metadata_store() -> MetadataStore:
     return _metadata_store
 
 
-def build_rag_context_from_results(relevant_files: list[FileMetadata]) -> tuple[str, list[str]]:
+def build_rag_context_from_results(results) -> tuple[str, list[str]]:
     """
-    Build formatted RAG context and file list from search results.
+    Build formatted RAG context and identifier list from search results.
     
     Args:
-        relevant_files: List of FileMetadata objects from RAG search
+        results: List of RAGResult objects from RAG search (files and/or conversations)
         
     Returns:
-        Tuple of (formatted_context_string, list_of_filenames)
+        Tuple of (formatted_context_string, list_of_identifiers)
     """
-    context_parts = ["Here are relevant files from the knowledge base:\n"]
-    file_list = []
+    from app.models.rag_result import RAGResult
     
-    for file_meta in relevant_files:
-        context_parts.append(f"- {file_meta.fileName}")
-        context_parts.append(f"  Type: {file_meta.type}")
-        if file_meta.creationTime:
-            context_parts.append(f"  Created: {file_meta.creationTime}")
-        context_parts.append(f"  Tags: {', '.join(file_meta.tags)}")
-        if file_meta.description:
-            context_parts.append(f"  Description: {file_meta.description}")
-        
-        # Include any extra/unknown metadata fields (Pydantic v2 stores in __pydantic_extra__)
-        if hasattr(file_meta, '__pydantic_extra__') and file_meta.__pydantic_extra__:
-            for field_name, field_value in file_meta.__pydantic_extra__.items():
-                if field_value is not None:
-                    if isinstance(field_value, list):
-                        context_parts.append(f"  {field_name}: {', '.join(str(v) for v in field_value)}")
-                    elif isinstance(field_value, dict):
-                        import json
-                        context_parts.append(f"  {field_name}: {json.dumps(field_value)}")
-                    else:
-                        context_parts.append(f"  {field_name}: {field_value}")
-        
-        context_parts.append("")
-        file_list.append(file_meta.fileName)
+    context_parts = ["Here are relevant items from the knowledge base:\n"]
+    id_list = []
+    
+    for result in results:
+        if isinstance(result, RAGResult):
+            if result.source == "file" and result.file_metadata:
+                file_meta = result.file_metadata
+                context_parts.append(f"- {file_meta.fileName}")
+                context_parts.append(f"  Type: {file_meta.type}")
+                if file_meta.creationTime:
+                    context_parts.append(f"  Created: {file_meta.creationTime}")
+                context_parts.append(f"  Tags: {', '.join(file_meta.tags)}")
+                if file_meta.description:
+                    context_parts.append(f"  Description: {file_meta.description}")
+                
+                if hasattr(file_meta, '__pydantic_extra__') and file_meta.__pydantic_extra__:
+                    for field_name, field_value in file_meta.__pydantic_extra__.items():
+                        if field_value is not None:
+                            if isinstance(field_value, list):
+                                context_parts.append(f"  {field_name}: {', '.join(str(v) for v in field_value)}")
+                            elif isinstance(field_value, dict):
+                                import json
+                                context_parts.append(f"  {field_name}: {json.dumps(field_value)}")
+                            else:
+                                context_parts.append(f"  {field_name}: {field_value}")
+                
+                context_parts.append("")
+                id_list.append(file_meta.fileName)
+            
+            elif result.source == "conversation":
+                context_parts.append(f"- Memory from conversation ({result.identifier})")
+                context_parts.append(f"  Type: conversation_memory")
+                if result.summary:
+                    context_parts.append(f"  Summary: {result.summary}")
+                if result.compacted_at:
+                    context_parts.append(f"  Compacted: {result.compacted_at}")
+                context_parts.append("")
+                id_list.append(result.identifier)
+        else:
+            # Legacy FileMetadata fallback
+            file_meta = result
+            context_parts.append(f"- {file_meta.fileName}")
+            context_parts.append(f"  Type: {file_meta.type}")
+            if file_meta.creationTime:
+                context_parts.append(f"  Created: {file_meta.creationTime}")
+            context_parts.append(f"  Tags: {', '.join(file_meta.tags)}")
+            if file_meta.description:
+                context_parts.append(f"  Description: {file_meta.description}")
+            context_parts.append("")
+            id_list.append(file_meta.fileName)
     
     context = "\n".join(context_parts)
-    return context, file_list
+    return context, id_list
 
 
 @router.get("/config", response_model=ConfigResponse)
@@ -772,10 +799,10 @@ async def load_rag():
     result = rag_service.load_rag(metadata_store)
     
     if result["success"]:
-        # Also initialize/load conversation knowledge base
-        knowledge_service = get_knowledge_service()
-        knowledge_service.initialize()
-        knowledge_service.load()
+        # Also load conversation compaction data
+        compaction_service = get_conversation_compaction_service()
+        compaction_service.initialize()
+        compaction_service.load()
         
         return StatusResponse(
             status="success",
@@ -1052,12 +1079,16 @@ async def generate_rag_ws(websocket: WebSocket):
         await progress_callback("Building RAG database...")
         
         result = await rag_service.build_rag(metadata_store, progress_callback)
-        
-        # Also initialize conversation knowledge base
-        knowledge_service = get_knowledge_service()
-        knowledge_service.initialize()
-        knowledge_service.load()
-        
+
+        # Backfill tags for any compacted conversations that predate the tag feature
+        compaction_service = get_conversation_compaction_service()
+        if not compaction_service.is_loaded():
+            compaction_service.load()
+        backfilled = compaction_service.backfill_missing_tags()
+        if backfilled > 0:
+            compaction_service.save()
+            await progress_callback(f"Backfilled tags for {backfilled} conversation(s) missing tags")
+
         # Check for mismatched embeddings
         if result.get("mismatched_files"):
             await websocket.send_json(
@@ -1079,7 +1110,8 @@ async def generate_rag_ws(websocket: WebSocket):
                     "total_indexed": result["total_indexed"],
                     "removed_count": result["removed_count"],
                     "mismatched_files": result.get("mismatched_files", []),
-                    "majority_dimension": result["majority_dimension"]
+                    "majority_dimension": result["majority_dimension"],
+                    "conversation_count": result.get("conversation_count", 0)
                 }
             ).to_json()
         )
@@ -1674,9 +1706,9 @@ async def chat_ws(websocket: WebSocket):
                     ).to_json()
                 )
         
-        # Load embedding model if RAG or knowledge storage needs it
+        # Load embedding model if RAG needs it
         embedding_loaded = False
-        if rag_available or config.enable_knowledge_storage:
+        if rag_available:
             await websocket.send_json(
                 WebSocketMessage(
                     type="status",
@@ -1861,41 +1893,6 @@ async def chat_ws(websocket: WebSocket):
                         message=f"RAG search failed: {e}"
                     ).to_json()
                 )
-        
-        # Search conversation knowledge base for relevant past facts
-        knowledge_context = ""
-        user_message_embedding = None
-        knowledge_service = get_knowledge_service()
-        if config.enable_knowledge_storage and embedding_loaded:
-            try:
-                # Embed user message once while the embedding model is already loaded
-                user_message_embedding = await llm_service.embed(user_message)
-                if knowledge_service.is_loaded():
-                    relevant_facts = knowledge_service.select_knowledge(
-                        user_message_embedding,
-                        token_budget=config.max_knowledge_tokens,
-                        min_relevance=config.min_knowledge_relevance,
-                    )
-                    if relevant_facts:
-                        fact_lines = [f"- {f['message']}" for f in relevant_facts]
-                        knowledge_context = "\n\nRelevant information from previous conversations:\n" + "\n".join(fact_lines)
-                        await websocket.send_json(
-                            WebSocketMessage(
-                                type="status",
-                                message=f"Found {len(relevant_facts)} relevant facts from conversation history"
-                            ).to_json()
-                        )
-            except Exception as e:
-                # Non-fatal: knowledge retrieval failure shouldn't block chat
-                await websocket.send_json(
-                    WebSocketMessage(
-                        type="status",
-                        message=f"Knowledge retrieval skipped: {e}"
-                    ).to_json()
-                )
-        
-        # Append knowledge context to RAG context
-        context = context + knowledge_context
         
         # Now load the chat/vision model for generation
         model_type = "vision" if use_vision else "chat"
@@ -2100,24 +2097,6 @@ async def chat_ws(websocket: WebSocket):
         # Unload model and close connection automatically after response
         if llm_service:
             await llm_service.unload_model()
-        
-        # Store objective facts from conversation into knowledge base (async, non-blocking)
-        if config.enable_knowledge_storage:
-            try:
-                knowledge_service = get_knowledge_service()
-                knowledge_service._objectivity_threshold = config.objectivity_threshold
-                
-                # Check user message for objective content (only user messages enter facts)
-                user_obj, user_score = knowledge_service.should_store(user_message)
-                if user_obj:
-                    # Pass the precomputed embedding so no model reload is needed
-                    knowledge_service.add_fact(
-                        user_message, "user", user_score,
-                        embedding=user_message_embedding,
-                    )
-            except Exception as e:
-                # Non-fatal: knowledge storage failure shouldn't break chat
-                print(f"Knowledge storage error (non-fatal): {e}")
         
     except WebSocketDisconnect:
         # Client disconnected - cancel any running generation
@@ -2351,13 +2330,24 @@ async def cloud_chat_ws(websocket: WebSocket):
                     "rag_context": rag_context,
                     "relevant_files": file_list,
                     "file_details": [
-                        {
-                            "fileName": f.fileName,
-                            "type": f.type,
-                            "tags": f.tags,
-                            "description": f.description,
-                            "creationTime": f.creationTime
-                        } for f in relevant_files
+                        (
+                            {
+                                "fileName": r.file_metadata.fileName,
+                                "type": r.file_metadata.type,
+                                "tags": r.file_metadata.tags,
+                                "description": r.file_metadata.description,
+                                "creationTime": r.file_metadata.creationTime,
+                                "source": "file"
+                            } if r.source == "file" and r.file_metadata else
+                            {
+                                "fileName": r.identifier,
+                                "type": "conversation_memory",
+                                "tags": [],
+                                "description": r.summary,
+                                "creationTime": r.compacted_at,
+                                "source": "conversation"
+                            }
+                        ) for r in relevant_files
                     ],
                     "image_context": image_context,
                     "user_message": user_message,
@@ -2392,6 +2382,420 @@ async def cloud_chat_ws(websocket: WebSocket):
         await websocket.close()
 
 
+@router.websocket("/compact-conversations")
+async def compact_conversations_ws(websocket: WebSocket):
+    """
+    Compact (summarize) conversations via LLM and embed them for RAG retrieval.
+    
+    Reads conversation_map.json from the RAG folder, summarizes uncompacted
+    conversations using the chat model, embeds summaries, and stores results
+    in the conversation compaction service. After compaction, call /generate-rag
+    to include conversation embeddings in the main RAG index.
+    
+    Request: {"count": 5, "force_recompact": false, "chat_model": null, "embedding_model": null}
+    """
+    await websocket.accept()
+    
+    llm_service = None
+    
+    try:
+        config = get_config()
+        llm_service = get_llm_service()
+        compaction_service = get_conversation_compaction_service()
+        
+        # Receive request
+        msg_data = await websocket.receive_json()
+        count = msg_data.get("count", 5)
+        force_recompact = msg_data.get("force_recompact", False)
+        chat_model = msg_data.get("chat_model") or config.chat_model
+        embedding_model = msg_data.get("embedding_model") or config.embedding_model
+        
+        if count < 1:
+            await websocket.send_json(
+                WebSocketMessage(type="error", message="count must be >= 1").to_json()
+            )
+            return
+        
+        # Read conversation_map.json from RAG folder
+        rag_dir = config.get_rag_directory()
+        if not rag_dir:
+            await websocket.send_json(
+                WebSocketMessage(type="error", message="No RAG directory configured. Set storage metadata first.").to_json()
+            )
+            return
+        
+        conversation_map_path = rag_dir / "conversation_map.json"
+        if not conversation_map_path.exists():
+            await websocket.send_json(
+                WebSocketMessage(type="error", message="conversation_map.json not found in RAG directory.").to_json()
+            )
+            return
+        
+        with open(conversation_map_path, "r") as f:
+            conversation_map = json.load(f)
+        
+        total_conversations = len(conversation_map)
+        
+        await websocket.send_json(
+            WebSocketMessage(
+                type="status",
+                message=f"Found {total_conversations} conversations in conversation_map.json"
+            ).to_json()
+        )
+        
+        # Initialize and load compaction service
+        compaction_service.initialize()
+        compaction_service.load()
+
+        # Safety check: backfill tags for any stored conversation that is missing them
+        backfilled = compaction_service.backfill_missing_tags()
+        if backfilled > 0:
+            compaction_service.save()
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message=f"Backfilled tags for {backfilled} existing conversation(s)"
+                ).to_json()
+            )
+
+        already_compacted = compaction_service.get_compacted_ids()
+        
+        # Filter conversations
+        if force_recompact:
+            candidates = list(conversation_map.keys())
+        else:
+            candidates = [cid for cid in conversation_map.keys() if cid not in already_compacted]
+        
+        to_compact = candidates[:count]
+        
+        if not to_compact:
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="result",
+                    message="No conversations to compact",
+                    data={
+                        "compacted_ids": [],
+                        "compacted_count": 0,
+                        "remaining_uncompacted": len(candidates),
+                        "total_conversations": total_conversations
+                    }
+                ).to_json()
+            )
+            return
+        
+        await websocket.send_json(
+            WebSocketMessage(
+                type="status",
+                message=f"Compacting {len(to_compact)} conversations (already compacted: {len(already_compacted)})..."
+            ).to_json()
+        )
+        
+        # Phase 1: Summarize with chat model
+        await websocket.send_json(
+            WebSocketMessage(type="status", message=f"Loading chat model {chat_model}...").to_json()
+        )
+        await llm_service.load_model(chat_model)
+        
+        summaries = {}
+        for i, conv_id in enumerate(to_compact):
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message=f"Compacting conversation {i+1}/{len(to_compact)}: {conv_id}"
+                ).to_json()
+            )
+            
+            # Build conversation text
+            messages_list = conversation_map[conv_id]
+            if isinstance(messages_list, list):
+                conv_text = "\n".join(
+                    f"{m.get('role', 'unknown')}: {m.get('content', '')}"
+                    for m in messages_list
+                )
+            else:
+                conv_text = str(messages_list)
+            
+            # Build LLM prompt
+            llm_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a personal memory extraction system. Given a conversation, extract "
+                        "facts about the user that are worth remembering for future interactions — "
+                        "such as personal preferences, traits, life details, stated goals, diagnoses, "
+                        "decisions, or any information the user revealed or that was inferred about them. "
+                        "Write each fact as a short, direct statement. "
+                        "If there are multiple distinct facts, list them one per line. "
+                        "Do not summarise what happened or what was discussed — only state facts about the user. "
+                        "If there are no facts about the user worth remembering, respond with exactly: "
+                        "'nothing to remember'. Do not add any explanation or preamble."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"Conversation:\n{conv_text}"
+                }
+            ]
+            
+            # Generate summary (non-streaming)
+            summary = ""
+            async for chunk in llm_service.generate(llm_messages, stream=False):
+                summary += chunk
+            summary = summary.strip()
+            tags = extract_tags_from_summary(summary)
+
+            summaries[conv_id] = (summary, tags)
+            
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="progress",
+                    message=f"Summarized {i+1}/{len(to_compact)}",
+                    data={"conversation_id": conv_id, "summary": summary, "current": i+1, "total": len(to_compact)}
+                ).to_json()
+            )
+        
+        # Phase 2: Embed summaries with embedding model
+        await websocket.send_json(
+            WebSocketMessage(type="status", message=f"Loading embedding model {embedding_model}...").to_json()
+        )
+        await llm_service.load_model(embedding_model)
+        
+        compacted_ids = []
+        for i, (conv_id, (summary, tags)) in enumerate(summaries.items()):
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message=f"Embedding summary {i+1}/{len(summaries)}: {conv_id}"
+                ).to_json()
+            )
+            
+            embedding = await llm_service.embed(summary)
+            compaction_service.add_compacted_conversation(conv_id, summary, embedding, tags)
+            compacted_ids.append(conv_id)
+        
+        # Save to disk
+        compaction_service.save()
+        
+        await websocket.send_json(
+            WebSocketMessage(type="status", message="Unloading model...").to_json()
+        )
+        await llm_service.unload_model()
+        
+        compacted_ids_set = compaction_service.get_compacted_ids()
+        remaining_uncompacted = len([cid for cid in conversation_map.keys() if cid not in compacted_ids_set])
+        
+        await websocket.send_json(
+            WebSocketMessage(
+                type="result",
+                message=f"Successfully compacted {len(compacted_ids)} conversations",
+                data={
+                    "compacted_ids": compacted_ids,
+                    "compacted_count": len(compacted_ids),
+                    "remaining_uncompacted": remaining_uncompacted,
+                    "total_conversations": total_conversations
+                }
+            ).to_json()
+        )
+        
+    except WebSocketDisconnect:
+        if llm_service:
+            await llm_service.unload_model()
+    except Exception as e:
+        error_details = {
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "traceback": traceback.format_exc()
+        }
+        await websocket.send_json(
+            WebSocketMessage(
+                type="error",
+                message=f"Compaction error: {type(e).__name__}: {str(e)}",
+                data=error_details
+            ).to_json()
+        )
+        if llm_service:
+            await llm_service.unload_model()
+    finally:
+        await websocket.close()
+
+
+@router.websocket("/cloud-compact")
+async def cloud_compact_ws(websocket: WebSocket):
+    """
+    Cloud-compact endpoint: client provides conversation IDs and pre-computed summaries;
+    server embeds them and stores results in the conversation compaction service.
+
+    Designed for use with Cloud AI workflows where the client app performs summarization
+    itself (using a cloud LLM) and the local server is only responsible for embedding.
+
+    Request:
+        {
+            "conversations": [
+                {"id": "conv_abc123", "summary": "User asked about..."},
+                ...
+            ],
+            "embedding_model": null,   // optional, defaults to config
+            "force_reembed": false     // re-embed even if already present
+        }
+
+    Result:
+        {
+            "embedded_ids": ["conv_abc123", ...],
+            "embedded_count": N,
+            "skipped_count": M
+        }
+    """
+    await websocket.accept()
+
+    llm_service = None
+
+    try:
+        config = get_config()
+        llm_service = get_llm_service()
+        compaction_service = get_conversation_compaction_service()
+
+        # Receive request
+        msg_data = await websocket.receive_json()
+        conversations = msg_data.get("conversations")
+        embedding_model = msg_data.get("embedding_model") or config.embedding_model
+        force_reembed = msg_data.get("force_reembed", False)
+
+        # Validate input
+        if not conversations or not isinstance(conversations, list):
+            await websocket.send_json(
+                WebSocketMessage(type="error", message="conversations must be a non-empty list").to_json()
+            )
+            return
+
+        for entry in conversations:
+            if not isinstance(entry, dict) or "id" not in entry or "summary" not in entry:
+                await websocket.send_json(
+                    WebSocketMessage(
+                        type="error",
+                        message="Each entry in conversations must have 'id' and 'summary' fields"
+                    ).to_json()
+                )
+                return
+
+        # Initialize and load compaction service
+        compaction_service.initialize()
+        compaction_service.load()
+
+        # Safety check: backfill tags for any stored conversation that is missing them
+        backfilled = compaction_service.backfill_missing_tags()
+        if backfilled > 0:
+            compaction_service.save()
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message=f"Backfilled tags for {backfilled} existing conversation(s)"
+                ).to_json()
+            )
+
+        already_embedded = compaction_service.get_compacted_ids()
+
+        # Filter out already-embedded entries unless force_reembed
+        if force_reembed:
+            to_embed = conversations
+        else:
+            to_embed = [c for c in conversations if c["id"] not in already_embedded]
+
+        skipped_count = len(conversations) - len(to_embed)
+
+        if not to_embed:
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="result",
+                    message="No new conversations to embed",
+                    data={
+                        "embedded_ids": [],
+                        "embedded_count": 0,
+                        "skipped_count": skipped_count
+                    }
+                ).to_json()
+            )
+            return
+
+        await websocket.send_json(
+            WebSocketMessage(
+                type="status",
+                message=f"Embedding {len(to_embed)} conversation summaries (skipping {skipped_count} already embedded)..."
+            ).to_json()
+        )
+
+        # Load embedding model
+        await websocket.send_json(
+            WebSocketMessage(type="status", message=f"Loading embedding model {embedding_model}...").to_json()
+        )
+        await llm_service.load_model(embedding_model)
+
+        embedded_ids = []
+        for i, entry in enumerate(to_embed):
+            conv_id = entry["id"]
+            summary = entry["summary"]
+            tags = extract_tags_from_summary(summary)
+
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="status",
+                    message=f"Embedding summary {i+1}/{len(to_embed)}: {conv_id}"
+                ).to_json()
+            )
+
+            embedding = await llm_service.embed(summary)
+            compaction_service.add_compacted_conversation(conv_id, summary, embedding, tags)
+            embedded_ids.append(conv_id)
+
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="progress",
+                    message=f"Embedded {i+1}/{len(to_embed)}",
+                    data={"conversation_id": conv_id, "current": i + 1, "total": len(to_embed)}
+                ).to_json()
+            )
+
+        # Save to disk
+        compaction_service.save()
+
+        await websocket.send_json(
+            WebSocketMessage(type="status", message="Unloading embedding model...").to_json()
+        )
+        await llm_service.unload_model()
+
+        await websocket.send_json(
+            WebSocketMessage(
+                type="result",
+                message=f"Successfully embedded {len(embedded_ids)} conversation summaries",
+                data={
+                    "embedded_ids": embedded_ids,
+                    "embedded_count": len(embedded_ids),
+                    "skipped_count": skipped_count
+                }
+            ).to_json()
+        )
+
+    except WebSocketDisconnect:
+        if llm_service:
+            await llm_service.unload_model()
+    except Exception as e:
+        error_details = {
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "traceback": traceback.format_exc()
+        }
+        await websocket.send_json(
+            WebSocketMessage(
+                type="error",
+                message=f"Cloud-compact error: {type(e).__name__}: {str(e)}",
+                data=error_details
+            ).to_json()
+        )
+        if llm_service:
+            await llm_service.unload_model()
+    finally:
+        await websocket.close()
+
+
 @router.websocket("/deep-chat")
 async def deep_chat_ws(websocket: WebSocket):
     """
@@ -2414,7 +2818,6 @@ async def deep_chat_ws(websocket: WebSocket):
         config = get_config()
         llm_service = get_llm_service()
         rag_service = get_rag_service()
-        knowledge_service = get_knowledge_service()
         metadata_store = get_metadata_store()
         
         # Deep chat requires server mode for tool calling
@@ -2430,7 +2833,6 @@ async def deep_chat_ws(websocket: WebSocket):
         # Deep chat: lightweight session prep (no embedding model at startup)
         # The orchestrator handles model swapping during worker execution
         rag_service = get_rag_service()
-        knowledge_service = get_knowledge_service()
         
         # Check if metadata file has been updated
         if await metadata_store.reload_if_modified():
@@ -2537,7 +2939,6 @@ async def deep_chat_ws(websocket: WebSocket):
             config=config,
             metadata_store=metadata_store,
             rag_service=rag_service,
-            knowledge_service=knowledge_service,
             llm_service=llm_service,
             face_service=face_service,
             rag_available=rag_available,
@@ -2556,13 +2957,6 @@ async def deep_chat_ws(websocket: WebSocket):
         # Unload model
         if llm_service:
             await llm_service.unload_model()
-        
-        # Store objective facts from conversation into knowledge base
-        await chat_helpers.store_objective_facts(
-            user_message,
-            None,  # We don't have the embedding readily available here
-            embedding_loaded
-        )
         
     except WebSocketDisconnect:
         if llm_service:
@@ -2593,6 +2987,265 @@ async def deep_chat_ws(websocket: WebSocket):
     finally:
         await websocket.close()
 
+
+@router.websocket("/scoped-rag-search")
+async def scoped_rag_search_ws(websocket: WebSocket):
+    """Scoped RAG Search — Enables Cloud AI to perform Deep Chat.
+
+    Accepts a JSON message with search parameters and returns the filtered,
+    semantically ranked candidates (files + conversations) as structured data
+    the calling Cloud AI can use for synthesis.
+
+    The endpoint also supports a ``get_library_context`` action which returns
+    library tags, conversation keywords, and date range so the Cloud AI can
+    build its own extraction prompt.
+
+    --- get_library_context ---
+    Request:  {"action": "get_library_context"}
+    Response: {type: "result", data: {top_tags, total_tags, conv_tags, date_range}}
+
+    --- scoped_search ---
+    Request:  {
+        "action": "scoped_search",
+        "rag_query": "semantic search phrase",
+        "start_date": "YYYY-MM-DD" | null,
+        "end_date": "YYYY-MM-DD" | null,
+        "tags": ["tag1", "tag2"] | null,
+        "k": 8,
+        "embedding_model": null
+    }
+    Response: {type: "result", data: {candidates: [...], file_count, conv_count}}
+    """
+    await websocket.accept()
+    llm_service = None
+
+    try:
+        config = get_config()
+        llm_service = get_llm_service()
+        metadata_store = get_metadata_store()
+
+        if await metadata_store.reload_if_modified():
+            await websocket.send_json(
+                WebSocketMessage(type="status", message="Storage metadata reloaded.").to_json()
+            )
+
+        # Ensure RAG is available
+        rag_service = get_rag_service()
+        if not rag_service.is_loaded():
+            load_result = rag_service.load_rag(metadata_store)
+            if not (isinstance(load_result, dict) and load_result.get("success", False)):
+                await websocket.send_json(
+                    WebSocketMessage(
+                        type="error",
+                        message="RAG database not available. Generate RAG first using /generate-rag."
+                    ).to_json()
+                )
+                return
+
+        # Load compaction service
+        compaction_service = get_conversation_compaction_service()
+        if not compaction_service.is_loaded():
+            compaction_service.load()
+
+        await websocket.send_json(
+            WebSocketMessage(type="status", message="Scoped RAG Search ready.").to_json()
+        )
+
+        # --------------- message loop ---------------
+        while True:
+            try:
+                msg_data = await websocket.receive_json()
+            except WebSocketDisconnect:
+                break
+
+            action = msg_data.get("action", "scoped_search")
+
+            # -------- get_library_context --------
+            if action == "get_library_context":
+                from app.services.deep_chat_handler import (
+                    _get_library_tags_and_dates,
+                )
+                top_tags, total_tags, conv_tags, date_range = _get_library_tags_and_dates(
+                    metadata_store, compaction_service
+                )
+                all_meta = metadata_store.get_all_metadata()
+
+                # Conversation summary count
+                conv_data = compaction_service.get_all_data()
+                conv_count = sum(1 for d in conv_data.values() if d.get("embedding"))
+
+                await websocket.send_json(
+                    WebSocketMessage(
+                        type="result",
+                        message="Library context retrieved",
+                        data={
+                            "top_tags": top_tags,
+                            "total_tags": total_tags,
+                            "conv_tags": conv_tags,
+                            "date_range": {"min": date_range[0], "max": date_range[1]},
+                            "file_count": len(all_meta),
+                            "conversation_count": conv_count,
+                        }
+                    ).to_json()
+                )
+                continue
+
+            # -------- scoped_search --------
+            if action == "scoped_search":
+                rag_query = msg_data.get("rag_query", "")
+                start_date = msg_data.get("start_date")
+                end_date = msg_data.get("end_date")
+                tags = msg_data.get("tags")
+                k = min(msg_data.get("k", 8), 20)  # cap at 20
+                embedding_model = msg_data.get("embedding_model") or config.embedding_model
+
+                if not rag_query:
+                    await websocket.send_json(
+                        WebSocketMessage(type="error", message="rag_query is required.").to_json()
+                    )
+                    continue
+
+                from app.services.deep_chat_handler import (
+                    _filter_by_date,
+                    _filter_by_tags,
+                    _scoped_rag_search,
+                    _format_candidate_for_context,
+                    ConversationCandidate,
+                )
+
+                await websocket.send_json(
+                    WebSocketMessage(type="status", message="Filtering candidates...").to_json()
+                )
+
+                all_meta = metadata_store.get_all_metadata()
+                file_candidates = list(all_meta)
+
+                # Date filter
+                if start_date and end_date:
+                    date_filtered = _filter_by_date(all_meta, start_date, end_date)
+                    if date_filtered:
+                        file_candidates = date_filtered
+                        await websocket.send_json(
+                            WebSocketMessage(
+                                type="status",
+                                message=f"Date filter: {len(file_candidates)} file(s) ({start_date} to {end_date})"
+                            ).to_json()
+                        )
+
+                # Build conversation candidates
+                conv_candidates = [
+                    ConversationCandidate(
+                        conv_id=cid,
+                        summary=d.get("summary", ""),
+                        tags=d.get("tags", []),
+                        compacted_at=d.get("compactedAt", ""),
+                    )
+                    for cid, d in compaction_service.get_all_data().items()
+                    if d.get("embedding")
+                ]
+
+                # Tag filter
+                if tags:
+                    tag_filtered_files = _filter_by_tags(file_candidates, tags)
+                    if tag_filtered_files:
+                        file_candidates = tag_filtered_files
+                    tag_filtered_convs = _filter_by_tags(conv_candidates, tags)
+                    if tag_filtered_convs:
+                        conv_candidates = tag_filtered_convs
+
+                all_candidates = file_candidates + conv_candidates
+
+                await websocket.send_json(
+                    WebSocketMessage(
+                        type="status",
+                        message=f"Semantic ranking {len(file_candidates)} file(s) + {len(conv_candidates)} conversation(s)..."
+                    ).to_json()
+                )
+
+                # Scoped RAG search
+                ranked = await _scoped_rag_search(
+                    filtered_candidates=all_candidates,
+                    query=rag_query,
+                    k=k,
+                    llm_service=llm_service,
+                    embedding_model=embedding_model,
+                    metadata_store=metadata_store,
+                    compaction_service=compaction_service,
+                )
+
+                # Format results
+                result_items = []
+                result_file_count = 0
+                result_conv_count = 0
+                for c in ranked:
+                    if isinstance(c, ConversationCandidate):
+                        result_conv_count += 1
+                        result_items.append({
+                            "type": "conversation",
+                            "id": c.conv_id,
+                            "summary": c.summary,
+                            "tags": c.tags,
+                            "compacted_at": c.compacted_at,
+                            "formatted": _format_candidate_for_context(c),
+                        })
+                    else:
+                        result_file_count += 1
+                        result_items.append({
+                            "type": "file",
+                            "fileName": c.fileName,
+                            "creationTime": c.creationTime,
+                            "tags": c.tags,
+                            "description": c.description,
+                            "fileType": c.type,
+                            "formatted": _format_candidate_for_context(c),
+                        })
+
+                await websocket.send_json(
+                    WebSocketMessage(
+                        type="result",
+                        message=f"Found {len(ranked)} candidate(s)",
+                        data={
+                            "candidates": result_items,
+                            "file_count": result_file_count,
+                            "conv_count": result_conv_count,
+                        }
+                    ).to_json()
+                )
+
+                # Unload embedding model after search
+                await llm_service.unload_model()
+                continue
+
+            # -------- unknown action --------
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="error",
+                    message=f"Unknown action: {action}. Use 'get_library_context' or 'scoped_search'."
+                ).to_json()
+            )
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        error_details = {
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "traceback": traceback.format_exc(),
+        }
+        try:
+            await websocket.send_json(
+                WebSocketMessage(
+                    type="error",
+                    message=f"Scoped RAG search error: {type(e).__name__}: {str(e)}",
+                    data=error_details,
+                ).to_json()
+            )
+        except Exception:
+            pass
+        if llm_service:
+            await llm_service.unload_model()
+    finally:
+        await websocket.close()
 
 
 @router.post("/kill", response_model=StatusResponse)

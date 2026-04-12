@@ -172,28 +172,22 @@ class ServerConfig(BaseModel):
         description="DPI for PDF page rendering (72-600)"
     )
     
-    # Knowledge storage settings
-    enable_knowledge_storage: bool = Field(
+    # Conversation compaction settings
+    enable_conversation_compaction: bool = Field(
         default=True,
-        description="Enable automatic storage of objective/factual messages from conversations"
+        description="Enable conversation compaction (dreaming mechanism) for summarizing conversations into RAG"
     )
-    objectivity_threshold: float = Field(
-        default=0.3,
-        ge=0.0,
-        le=1.0,
-        description="Subjectivity threshold for knowledge filtering (0.0=only very objective, 1.0=store everything)"
-    )
-    max_knowledge_tokens: int = Field(
+    max_compaction_tokens: int = Field(
         default=2000,
         ge=100,
         le=8000,
-        description="Token budget for knowledge context injected into chat"
+        description="Token budget for compacted conversation context injected into chat"
     )
-    min_knowledge_relevance: float = Field(
+    min_compaction_relevance: float = Field(
         default=0.4,
         ge=0.0,
         le=1.0,
-        description="Minimum similarity score for knowledge retrieval"
+        description="Minimum similarity score for compacted conversation retrieval"
     )
     
     # Model file names
@@ -313,6 +307,12 @@ Use tools proactively to gather relevant information before answering. Be thorou
         ge=1,
         le=4,
         description="Number of parallel workers for deep chat (1-4). Workers share the same llama-server process."
+    )
+    deep_chat_max_short_extractions: int = Field(
+        default=2,
+        ge=0,
+        le=5,
+        description="Maximum number of Short Extraction cycles Deep Chat can perform when it needs additional context (0-5). Each cycle runs a targeted scoped-RAG search with AI-chosen parameters."
     )
 
     

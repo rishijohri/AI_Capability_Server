@@ -43,7 +43,6 @@ class MCPToolRegistry:
         self,
         metadata_store: MetadataStore,
         rag_service=None,
-        knowledge_service=None,
         llm_service=None,
         face_service=None,
         embedding_loaded: bool = False,
@@ -54,7 +53,6 @@ class MCPToolRegistry:
     ):
         self.metadata_store = metadata_store
         self.rag_service = rag_service
-        self.knowledge_service = knowledge_service
         self.llm_service = llm_service
         self.face_service = face_service
         self.embedding_loaded = embedding_loaded
@@ -74,7 +72,6 @@ class MCPToolRegistry:
             "list_known_people": self._list_known_people,
             "list_known_locations": self._list_known_locations,
             "get_library_stats": self._get_library_stats,
-            "search_knowledge": self._search_knowledge,
         }
 
     # ------------------------------------------------------------------
@@ -207,21 +204,6 @@ class MCPToolRegistry:
                     "name": "get_library_stats",
                     "description": "Get overall statistics about the media library: total files, type breakdown, date range, top tags/people/locations.",
                     "parameters": {"type": "object", "properties": {}},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "search_knowledge",
-                    "description": "Search the conversation knowledge base for previously discussed facts or information.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string", "description": "Search query for knowledge base"},
-                            "token_budget": {"type": "integer", "description": "Max tokens of results (default 1000)", "default": 1000},
-                        },
-                        "required": ["query"],
-                    },
                 },
             },
         ]
@@ -520,40 +502,4 @@ class MCPToolRegistry:
             lines.append(f"Top tags: {', '.join(f'{t}({c})' for t, c in top_tags)}")
         return "\n".join(lines)
 
-    async def _search_knowledge(self, args: Dict[str, Any]) -> str:
-        query = args.get("query", "")
-        token_budget = int(args.get("token_budget", 1000))
-        if not query:
-            return "Error: query is required."
 
-        if not self.knowledge_service:
-            return "Knowledge service is not available."
-
-        if not self.llm_service:
-            return "LLM service is not available (needed for embedding query)."
-
-        try:
-            # Swap to embedding model for query embedding
-            await self._swap_to_embedding()
-            try:
-                embedding = await self.llm_service.embed(query)
-            finally:
-                await self._restore_chat_model()
-
-            facts = self.knowledge_service.select_knowledge(
-                query_embedding=embedding,
-                token_budget=token_budget,
-            )
-        except Exception as e:
-            return f"Knowledge search failed: {str(e)}"
-
-        if not facts:
-            return f"No relevant knowledge found for '{query}'."
-
-        lines = [f"Found {len(facts)} relevant fact(s):"]
-        for fact in facts:
-            role = fact.get("role", "unknown")
-            message = fact.get("message", "")
-            ts = fact.get("timestamp", "")
-            lines.append(f"- [{role}] ({ts}): {message}")
-        return "\n".join(lines)

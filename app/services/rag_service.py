@@ -14,6 +14,7 @@ except ImportError:
 
 from app.config import get_config
 from app.models import FileMetadata, MetadataStore
+from app.models.rag_result import RAGResult
 from app.services.embedding_service import get_embedding_service
 
 
@@ -204,6 +205,48 @@ class RAGService:
         self.vector_db.add_vectors(vectors, filenames)
         self.metadata_store = metadata_store
         
+        # --- Merge conversation embeddings into the same index ---
+        conversation_count = 0
+        try:
+            from app.services.conversation_compaction_service import get_conversation_compaction_service
+            compaction_service = get_conversation_compaction_service()
+            if not compaction_service.is_loaded():
+                compaction_service.initialize()
+                compaction_service.load()
+            
+            conv_embeddings = compaction_service.get_all_embeddings()
+            if conv_embeddings:
+                if progress_callback:
+                    await progress_callback(f"Adding {len(conv_embeddings)} conversation embedding(s) to RAG index...")
+                
+                conv_ids = []
+                conv_vecs = []
+                for cid, emb in conv_embeddings.items():
+                    emb_dim = len(emb)
+                    if emb_dim == dimension:
+                        conv_ids.append(f"conv:{cid}")
+                        conv_vecs.append(emb)
+                    elif self.use_reduced_embeddings and emb_dim == original_dim:
+                        reduced = embedding_service.reduce_single_embedding(emb)
+                        conv_ids.append(f"conv:{cid}")
+                        conv_vecs.append(reduced)
+                    else:
+                        if progress_callback:
+                            await progress_callback(
+                                f"Skipping conversation {cid}: dimension {emb_dim} "
+                                f"(expected {dimension})"
+                            )
+                
+                if conv_vecs:
+                    conv_array = np.array(conv_vecs)
+                    self.vector_db.add_vectors(conv_array, conv_ids)
+                    conversation_count = len(conv_ids)
+                    if progress_callback:
+                        await progress_callback(f"Added {conversation_count} conversation embedding(s) to index")
+        except Exception as e:
+            if progress_callback:
+                await progress_callback(f"Conversation embeddings skipped: {e}")
+        
         # Save to file
         rag_dir = config.get_rag_directory()
         if rag_dir:
@@ -220,7 +263,8 @@ class RAGService:
             "mismatched_files": mismatched_files,
             "majority_dimension": majority_dimension,
             "removed_count": len(mismatched_files),
-            "total_indexed": len(matched_embeddings)
+            "total_indexed": len(matched_embeddings) + conversation_count,
+            "conversation_count": conversation_count
         }
     
     def load_rag(self, metadata_store: MetadataStore) -> Dict[str, Any]:
@@ -281,17 +325,17 @@ class RAGService:
         query: str,
         k: Optional[int] = None,
         filters: Optional[Dict[str, Any]] = None
-    ) -> List[FileMetadata]:
+    ) -> List[RAGResult]:
         """
-        Search for relevant files using RAG.
+        Search for relevant files and conversations using RAG.
         
         Args:
             query: Search query
             k: Number of results (None for config default)
-            filters: Optional filters (keywords, etc.)
+            filters: Optional filters (keywords, etc.) — applied to file results only
             
         Returns:
-            List of relevant file metadata
+            List of RAGResult (files and/or conversations)
         """
         if not self.vector_db or not self.metadata_store:
             raise ValueError("RAG not loaded. Call load_rag or build_rag first.")
@@ -300,14 +344,10 @@ class RAGService:
         k = k or config.top_k
         
         # Generate query embedding using the currently loaded embedding model
-        # The embedding model should already be loaded by the caller
         embedding_service = get_embedding_service()
-        
-        # Use llm_service to generate embedding
         from app.services.llm_service import get_llm_service
         llm_service = get_llm_service()
         
-        # Generate embedding for query using currently loaded model
         query_embedding = await llm_service.embed(query)
         
         # Reduce if necessary
@@ -316,34 +356,57 @@ class RAGService:
         
         # Search vector database
         query_vector = np.array(query_embedding)
-        filenames, distances = self.vector_db.search(query_vector, k * 2)  # Get more for filtering
+        ids, distances = self.vector_db.search(query_vector, k * 2)  # Get more for filtering
+        
+        # Lazy-load compaction service for conversation lookups
+        compaction_service = None
         
         # Retrieve metadata and apply filters
-        results = []
-        for filename, distance in zip(filenames, distances):
-            metadata = self.metadata_store.get_metadata_by_filename(filename)
-            if metadata:
-                # Apply keyword filters if specified
-                if filters and "keywords" in filters:
-                    keywords = filters["keywords"]
-                    # Check if any keyword is in tags or description
-                    text_to_search = " ".join(metadata.tags).lower()
-                    if metadata.description:
-                        text_to_search += " " + metadata.description.lower()
+        file_results: List[RAGResult] = []
+        conv_results: List[RAGResult] = []
+        
+        for identifier, distance in zip(ids, distances):
+            if identifier.startswith("conv:"):
+                # --- Conversation result ---
+                conv_id = identifier[5:]  # strip "conv:" prefix
+                if compaction_service is None:
+                    from app.services.conversation_compaction_service import get_conversation_compaction_service
+                    compaction_service = get_conversation_compaction_service()
+                
+                summary = compaction_service.get_summary(conv_id)
+                if summary is not None:
+                    conv_results.append(RAGResult(
+                        source="conversation",
+                        identifier=conv_id,
+                        summary=summary,
+                        compacted_at=compaction_service.get_compacted_at(conv_id),
+                    ))
+            else:
+                # --- File result ---
+                metadata = self.metadata_store.get_metadata_by_filename(identifier)
+                if metadata:
+                    # Apply keyword filters (files only)
+                    if filters and "keywords" in filters:
+                        keywords = filters["keywords"]
+                        text_to_search = " ".join(metadata.tags).lower()
+                        if metadata.description:
+                            text_to_search += " " + metadata.description.lower()
+                        if not any(kw.lower() in text_to_search for kw in keywords):
+                            continue
                     
-                    if not any(kw.lower() in text_to_search for kw in keywords):
-                        continue
-                
-                results.append(metadata)
-                
-                if len(results) >= k:
-                    break
+                    file_results.append(RAGResult(
+                        source="file",
+                        identifier=identifier,
+                        file_metadata=metadata,
+                    ))
         
-        # Apply recency bias
-        if config.recency_bias > 1.0:
-            results = self._apply_recency_bias(results, config.recency_bias)
+        # Apply recency bias only to file results
+        if config.recency_bias > 1.0 and file_results:
+            file_results = self._apply_recency_bias_rag(file_results, config.recency_bias)
         
-        return results[:k]
+        # Merge: conversation results first (maintain FAISS ranking), then file results
+        combined = conv_results + file_results
+        return combined[:k]
     
     def _apply_recency_bias(
         self,
@@ -386,6 +449,33 @@ class RAGService:
         scored_results.sort(key=lambda x: x[0], reverse=True)
         
         return [metadata for _, metadata in scored_results]
+    
+    def _apply_recency_bias_rag(
+        self,
+        results: List[RAGResult],
+        bias_factor: float
+    ) -> List[RAGResult]:
+        """Apply recency bias to file-type RAGResults only."""
+        if not results:
+            return results
+        
+        now = datetime.now()
+        scored = []
+        
+        for idx, r in enumerate(results):
+            if r.source == "file" and r.file_metadata:
+                creation_time = r.file_metadata.get_creation_datetime()
+                age_days = (now - creation_time).days
+                recency_score = 1.0 / (1.0 + age_days / 365.0)
+                position_score = 1.0 / (idx + 1)
+                combined = position_score * (recency_score ** bias_factor)
+            else:
+                # Non-file results keep position-based score
+                combined = 1.0 / (idx + 1)
+            scored.append((combined, r))
+        
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [r for _, r in scored]
     
     def is_loaded(self) -> bool:
         """Check if RAG is loaded."""

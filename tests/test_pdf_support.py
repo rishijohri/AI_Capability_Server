@@ -13,7 +13,7 @@ from PIL import Image
 # Mock heavy transitive dependencies to avoid needing spacy models etc.
 for mod in [
     "app.services", "app.services.llm_service", "app.services.rag_service",
-    "app.services.knowledge_service", "app.models", "app.models.metadata",
+    "app.services.conversation_compaction_service", "app.models", "app.models.metadata",
     "app.models.requests", "app.models.responses",
     "app.utils.objectivity_detector", "app.utils.chat_helpers",
     "app.utils.process_manager", "app.utils.logging_config",

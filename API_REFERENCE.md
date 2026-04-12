@@ -81,6 +81,9 @@ The `fileName` field in `storage_metadata.json` should contain only the filename
 | `/api/chat` | WebSocket | Chat with RAG context |
 | `/api/deep-chat` | WebSocket | Multi-round thinking chat with RAG function access |
 | `/api/cloud-chat` | WebSocket | Get RAG context for external cloud LLM |
+| `/api/compact-conversations` | WebSocket | Compact (summarize) conversations for RAG memory |
+| `/api/cloud-compact` | WebSocket | Embed client-provided conversation summaries for RAG (cloud AI workflow) |
+| `/api/scoped-rag-search` | WebSocket | Scoped RAG search for Cloud AI Deep Chat (multi-message, persistent connection) |
 
 ---
 
@@ -128,7 +131,10 @@ curl http://localhost:8000/api/config
     "n_gpu_layers": 999
   },
   "rag_directory_name": "rag",
-  "storage_metadata_path": null
+  "storage_metadata_path": null,
+  "enable_conversation_compaction": true,
+  "max_compaction_tokens": 2000,
+  "min_compaction_relevance": 0.4
 }
 ```
 
@@ -155,6 +161,9 @@ curl http://localhost:8000/api/config
 | `model_timeout` | int | ✅ | Seconds before unloading inactive model |
 | `llm_timeout` | int | ✅ | Timeout for LLM operations in seconds (10-3600) |
 | `llm_params` | object | ✅ | LLM execution parameters |
+| `enable_conversation_compaction` | bool | ✅ | Enable conversation compaction (dreaming mechanism) for summarizing conversations into RAG |
+| `max_compaction_tokens` | int | ✅ | Token budget for compacted conversation context injected into chat (100-8000) |
+| `min_compaction_relevance` | float | ✅ | Minimum similarity score for compacted conversation retrieval (0.0-1.0) |
 | `rag_directory_name` | string | ❌ | RAG directory name (read-only) |
 | `storage_metadata_path` | string/null | ❌ | Current metadata path (read-only) |
 
@@ -704,7 +713,7 @@ curl -X POST http://localhost:8000/api/set-storage-metadata \
 
 ### POST /api/load-rag
 
-Load an existing RAG database from disk. The RAG directory is determined from the storage metadata path.
+Load an existing RAG database from disk. The RAG directory is determined from the storage metadata path. Also loads conversation compaction data if available.
 
 **Request:**
 ```bash
@@ -1451,7 +1460,8 @@ Build the RAG (Retrieval Augmented Generation) database from embeddings. Creates
     "total_indexed": 153,
     "removed_count": 3,
     "mismatched_files": ["image1.jpg", "image2.jpg", "video1.mp4"],
-    "majority_dimension": 768
+    "majority_dimension": 768,
+    "conversation_count": 12
   }
 }
 ```
@@ -1461,6 +1471,7 @@ Build the RAG (Retrieval Augmented Generation) database from embeddings. Creates
 - `removed_count`: Number of files excluded due to dimension mismatch
 - `mismatched_files`: List of filenames that were excluded (re-embed these with the correct model)
 - `majority_dimension`: The embedding dimension used for the RAG index
+- `conversation_count`: Number of compacted conversation embeddings merged into the RAG index (from `/api/compact-conversations`)
 
 **4. Connection Closes**
 
@@ -1983,19 +1994,18 @@ Invalid history role:
 
 ### WS /api/deep-chat
 
-Interactive chat with multi-round thinking and RAG function access. The LLM can perform multiple rounds of internal reasoning and has access to functions that allow querying both media RAG and conversation fact RAG. For the client, this endpoint acts the same as `/api/chat`.
+Interactive chat with multi-round thinking and RAG function access. The LLM can perform multiple rounds of internal reasoning and has access to functions that allow querying the media RAG (which includes both file embeddings and compacted conversation memories). For the client, this endpoint acts the same as `/api/chat`.
 
 **Important:** Each WebSocket connection handles a **single request-response cycle**. The connection automatically closes after the response is complete. For follow-up questions, initiate a new WebSocket connection and provide the conversation history via the `history` parameter.
 
 **Connection:** `ws://localhost:8000/api/deep-chat`
 
 **Key Features:**
-- **Initial context gathering**: Automatic limited RAG search (top 3 media files, 500 tokens of facts) before Round 1
+- **Initial context gathering**: Automatic limited RAG search (top 3 results) before Round 1
 - **Multi-round thinking**: The LLM performs `chat_rounds` iterations of internal reasoning (configurable via `/api/config`)
 - **Enhanced system prompt**: Uses a specialized "Deep Thinking mode" prompt that strongly encourages function usage
 - **RAG function calling**: In each round, the LLM can call functions to:
-  - `query_media_rag(query, k)`: Search media files (images, videos, etc.) with custom queries
-  - `query_fact_rag(query, k)`: Search conversation history for relevant facts with custom queries
+  - `query_media_rag(query, k)`: Search the unified RAG index (media files + compacted conversation memories) with custom queries
 - **Transparent to client**: The client sees only the final response, not intermediate thinking rounds
 - **Same interface as /api/chat**: Request and response format is identical to `/api/chat`
 
@@ -2005,6 +2015,7 @@ Interactive chat with multi-round thinking and RAG function access. The LLM can 
 |--------|-------------|------------------|
 | Initial RAG | Full automatic search | Limited automatic search (baseline) |
 | Additional RAG | None | LLM-controlled function calls |
+| RAG Scope | Unified index (files + conversations) | Same unified index, with targeted queries |
 | System Prompt | Standard chat prompt | Deep thinking prompt (encourages function use) |
 | LLM Control | No control over RAG | Full control via function calls |
 
@@ -2077,8 +2088,7 @@ Before thinking rounds begin, the server automatically performs a limited RAG se
 ```
 
 **Initial Context Includes:**
-- Top 3 media files from media RAG
-- Up to 500 tokens from fact RAG (conversation history)
+- Top 3 results from the unified RAG index (may include both media files and compacted conversation memories)
 
 This gives the LLM baseline information before Round 1.
 
@@ -2103,10 +2113,9 @@ The server sends status updates for each thinking round:
 During each round, the LLM can:
 1. Review initial context (Round 1 only) and previous round results
 2. Analyze the user's question with available information
-3. Call `query_media_rag(query, k)` with custom search queries for more specific files
-4. Call `query_fact_rag(query, k)` with custom queries for historical information
-5. Synthesize information from all sources
-6. Decide to continue thinking or provide final answer
+3. Call `query_media_rag(query, k)` with custom search queries — this searches the unified RAG index containing both media files and compacted conversation memories
+4. Synthesize information from all sources
+5. Decide to continue thinking or provide final answer
 
 The LLM uses a **Deep Thinking mode system prompt** that encourages:
 - Using functions to gather comprehensive information
@@ -2190,8 +2199,7 @@ Progress messages stream the final response:
 1. **Initial Gathering**: Server automatically searches RAG (limited results for baseline context)
 
 2. **Round 1**: LLM receives the question + initial context, then decides:
-   - Call `query_media_rag("beach photos summer 2024", k=10)` for comprehensive file list
-   - Call `query_fact_rag("beach vacation 2024", k=5)` for conversation history
+   - Call `query_media_rag("beach photos summer 2024", k=10)` for comprehensive results (files + conversation memories)
    
 3. **Round 2**: LLM receives function results and can:
    - Analyze the retrieved information
@@ -2215,7 +2223,7 @@ curl -X POST http://localhost:8000/api/config \
 **Benefits over /api/chat:**
 
 1. **Initial context + on-demand queries**: Gets baseline info automatically, then LLM can dive deeper
-2. **Better information gathering**: Can query both media and fact RAGs with custom search terms
+2. **Better information gathering**: Can query the unified RAG index (files + conversation memories) with custom search terms
 3. **Multi-step reasoning**: Can analyze results and make follow-up queries
 4. **More comprehensive answers**: Synthesizes information from multiple targeted sources
 5. **LLM-controlled search**: The AI decides what to search for and when
@@ -2345,11 +2353,19 @@ Get RAG context and system prompt for use with external cloud LLMs (OpenAI, Anth
     "file_details": [
       {
         "fileName": "vacation/beach_sunset.jpg",
-        "similarity": 0.892
+        "type": "photo",
+        "tags": ["beach", "sunset", "ocean"],
+        "description": "A beautiful sunset over the ocean...",
+        "creationTime": "2024-07-15T18:30:00",
+        "source": "file"
       },
       {
-        "fileName": "summer/surfing_day.jpg",
-        "similarity": 0.845
+        "fileName": "conv:Hello2026-04-08T10:09:35",
+        "type": "conversation_memory",
+        "tags": [],
+        "description": "User discussed their favorite beach vacation spots and planned a summer trip.",
+        "creationTime": "2026-04-08T10:15:00",
+        "source": "conversation"
       }
     ],
     "image_context": null,
@@ -2366,7 +2382,7 @@ Get RAG context and system prompt for use with external cloud LLMs (OpenAI, Anth
 | `system_prompt` | string | The configured chat system prompt from server config |
 | `rag_context` | string | Formatted text with relevant file information, ready to be included in your LLM prompt |
 | `relevant_files` | array[string] | List of relevant filenames |
-| `file_details` | array[object] | Detailed similarity scores for each file |
+| `file_details` | array[object] | Detailed metadata for each result. Each object includes a `source` field (`"file"` or `"conversation"`) to distinguish file results from compacted conversation memories |
 | `image_context` | object/null | If `image_name` provided: contains `image_name`, `tags`, `description`, and `image_base64` |
 | `user_message` | string | Echo of the user's message |
 | `history` | array/null | Echo of the provided conversation history |
@@ -2832,6 +2848,566 @@ print(response.json())
 
 ---
 
+### WS /api/compact-conversations
+
+Compact (summarize) conversations into memory entries for RAG retrieval. This is the "dreaming mechanism" — it reads raw conversations from `conversation_map.json`, uses the chat LLM to produce a concise summary for each, then embeds those summaries. After compacting, call `/api/generate-rag` to merge conversation embeddings into the main RAG index.
+
+**Use Case:** Automatically distill conversation history into searchable memories so the AI can recall past discussions in future chats. Similar to how dreaming consolidates memories.
+
+**Connection:** `ws://localhost:8000/api/compact-conversations`
+
+**Prerequisites:**
+- Storage metadata must be set (`/api/set-storage-metadata`)
+- A `conversation_map.json` file must exist in the RAG directory
+
+**conversation_map.json Format:**
+```json
+{
+  "Hello2026-04-08T10:09:35": [
+    {"role": "user", "content": "Hello, how are you?"},
+    {"role": "assistant", "content": "I'm doing well! How can I help you?"}
+  ],
+  "VacationPlanning2026-04-09T14:22:10": [
+    {"role": "user", "content": "Help me plan a beach vacation"},
+    {"role": "assistant", "content": "I'd love to help! What dates are you considering?"},
+    {"role": "user", "content": "July 2026, somewhere tropical"},
+    {"role": "assistant", "content": "Great! Here are some options..."}
+  ]
+}
+```
+
+Each key is a conversation ID and each value is an array of message objects with `role` and `content`.
+
+**1. Client Connects and Sends Request:**
+
+```json
+{
+  "count": 5,
+  "force_recompact": false,
+  "chat_model": null,
+  "embedding_model": null
+}
+```
+
+**Request Parameters:**
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `count` | int | ❌ | 5 | Maximum number of conversations to compact in this session |
+| `force_recompact` | bool | ❌ | false | If true, re-compact conversations from `conversation_map.json` even if they were already compacted. Only affects conversations present in `conversation_map.json` — any additional entries in `conversation_embeddings_map.json` (from previous compaction runs) are preserved unchanged |
+| `chat_model` | string/null | ❌ | null | Chat model to use for summarization (null = use config default) |
+| `embedding_model` | string/null | ❌ | null | Embedding model for summary embeddings (null = use config default) |
+
+**2. Server Loads Conversations and Begins Compaction:**
+
+```json
+{
+  "type": "status",
+  "message": "Found 15 conversations in conversation_map.json"
+}
+```
+
+```json
+{
+  "type": "status",
+  "message": "Compacting 5 conversations (already compacted: 3)..."
+}
+```
+
+```json
+{
+  "type": "status",
+  "message": "Loading chat model Qwen3-0.6B-Q4_K_M.gguf..."
+}
+```
+
+**3. Phase 1 — Summarization:**
+
+For each conversation, the server sends status and progress messages:
+
+```json
+{
+  "type": "status",
+  "message": "Compacting conversation 1/5: Hello2026-04-08T10:09:35"
+}
+```
+
+```json
+{
+  "type": "progress",
+  "message": "Summarized 1/5",
+  "data": {
+    "conversation_id": "Hello2026-04-08T10:09:35",
+    "summary": "User greeted the assistant; nothing notable discussed.",
+    "current": 1,
+    "total": 5
+  }
+}
+```
+
+The LLM summarization prompt instructs: *"Extract facts about the user worth remembering for future interactions — personal preferences, traits, life details, stated goals, diagnoses, decisions, or any information revealed or inferred about them. Write each fact as a short, direct statement (e.g. 'User prefers red and black shoes.'). List multiple facts one per line. Do not summarise what happened — only state facts about the user. If there are no facts worth remembering, respond with exactly: 'nothing to remember'."*
+
+**4. Phase 2 — Embedding:**
+
+```json
+{
+  "type": "status",
+  "message": "Loading embedding model embeddinggemma-300M-Q8_0.gguf..."
+}
+```
+
+```json
+{
+  "type": "status",
+  "message": "Embedding summary 1/5: Hello2026-04-08T10:09:35"
+}
+```
+
+**5. Server Saves and Returns Result:**
+
+```json
+{
+  "type": "status",
+  "message": "Unloading model..."
+}
+```
+
+```json
+{
+  "type": "result",
+  "message": "Successfully compacted 5 conversations",
+  "data": {
+    "compacted_ids": [
+      "Hello2026-04-08T10:09:35",
+      "VacationPlanning2026-04-09T14:22:10",
+      "PhotoSearch2026-04-09T15:00:00",
+      "WeatherChat2026-04-10T09:30:00",
+      "RecipeLookup2026-04-10T12:15:00"
+    ],
+    "compacted_count": 5,
+    "remaining_uncompacted": 7,
+    "total_conversations": 15
+  }
+}
+```
+
+**Result Data Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `compacted_ids` | array[string] | List of conversation IDs that were compacted |
+| `compacted_count` | int | Number of conversations compacted in this session |
+| `remaining_uncompacted` | int | Number of conversations in `conversation_map.json` that have not yet been compacted |
+| `total_conversations` | int | Total number of conversations in `conversation_map.json` |
+
+**6. Connection Closes Automatically**
+
+**After Compacting — Rebuild RAG:**
+
+After compacting conversations, call `/api/generate-rag` to rebuild the RAG index. The new index will include both file embeddings and conversation memory embeddings. The `conversation_count` field in the generate-rag result shows how many conversation embeddings were merged.
+
+**Error Cases:**
+
+No RAG directory:
+```json
+{
+  "type": "error",
+  "message": "No RAG directory configured. Set storage metadata first."
+}
+```
+
+Missing conversation map:
+```json
+{
+  "type": "error",
+  "message": "conversation_map.json not found in RAG directory."
+}
+```
+
+Invalid count:
+```json
+{
+  "type": "error",
+  "message": "count must be >= 1"
+}
+```
+
+No conversations to compact:
+```json
+{
+  "type": "result",
+  "message": "No conversations to compact",
+  "data": {
+    "compacted_ids": [],
+    "compacted_count": 0,
+    "remaining_uncompacted": 0,
+    "total_conversations": 15
+  }
+}
+```
+
+General error:
+```json
+{
+  "type": "error",
+  "message": "Compaction error: <ErrorType>: <details>"
+}
+```
+
+---
+
+### WS /api/cloud-compact
+
+**Connection:** `ws://localhost:8000/api/cloud-compact`
+
+**Description:** Embeds client-provided conversation summaries into the conversation compaction service. Designed for the **Cloud AI workflow**: the client app summarizes conversations using a cloud LLM (e.g., GPT-4, Claude) and sends the summaries here; the local server is only responsible for creating embeddings. No chat model is used on the server side.
+
+**Typical Workflow:**
+1. Client app summarizes conversations using a cloud LLM
+2. Client calls `/api/cloud-compact` with the summaries → server embeds them
+3. Client calls `/api/generate-rag` → conversation embeddings are merged into the RAG index
+4. Subsequent `/api/cloud-chat` or `/api/chat` calls will include conversation memory in RAG results
+
+**Use Case vs `/api/compact-conversations`:**
+
+| Feature | `/api/compact-conversations` | `/api/cloud-compact` |
+|---------|------------------------------|----------------------|
+| Summarization | Local chat model | Client-provided (cloud AI) |
+| Embedding | Local embedding model | Local embedding model |
+| Requires chat model | Yes | No |
+| Use when | Fully local workflow | Cloud AI companion workflow |
+
+---
+
+**Request Format:**
+
+```json
+{
+  "conversations": [
+    {"id": "conv_abc123", "summary": "User asked about vacation spots in Italy."},
+    {"id": "conv_def456", "summary": "Discussion about recipe modifications for gluten-free cooking."}
+  ],
+  "embedding_model": null,
+  "force_reembed": false
+}
+```
+
+**Request Parameters:**
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `conversations` | array | Yes | — | List of objects with `id` and `summary` fields |
+| `conversations[].id` | string | Yes | — | Unique conversation identifier |
+| `conversations[].summary` | string | Yes | — | Compacted summary text produced by the client |
+| `embedding_model` | string/null | No | config value | Local embedding model to use for embedding summaries |
+| `force_reembed` | boolean | No | `false` | If `true`, re-embed conversations that already have an entry |
+
+---
+
+**Message Sequence:**
+
+**1. Status — embedding started:**
+```json
+{
+  "type": "status",
+  "message": "Embedding 2 conversation summaries (skipping 0 already embedded)..."
+}
+```
+
+**2. Status — model loading:**
+```json
+{
+  "type": "status",
+  "message": "Loading embedding model nomic-embed-text-v1.5.Q4_K_M.gguf..."
+}
+```
+
+**3. Status — per-conversation progress:**
+```json
+{
+  "type": "status",
+  "message": "Embedding summary 1/2: conv_abc123"
+}
+```
+
+**4. Progress — after each embedding:**
+```json
+{
+  "type": "progress",
+  "message": "Embedded 1/2",
+  "data": {
+    "conversation_id": "conv_abc123",
+    "current": 1,
+    "total": 2
+  }
+}
+```
+
+**5. Status — model unloaded:**
+```json
+{"type": "status", "message": "Unloading embedding model..."}
+```
+
+**6. Result:**
+```json
+{
+  "type": "result",
+  "message": "Successfully embedded 2 conversation summaries",
+  "data": {
+    "embedded_ids": ["conv_abc123", "conv_def456"],
+    "embedded_count": 2,
+    "skipped_count": 0
+  }
+}
+```
+
+**7. Connection Closes Automatically**
+
+**Result Data Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `embedded_ids` | array[string] | Conversation IDs that were embedded in this call |
+| `embedded_count` | int | Number of summaries embedded |
+| `skipped_count` | int | Number of entries skipped because they were already embedded (and `force_reembed` was false) |
+
+**After Embedding — Rebuild RAG:**
+
+Call `/api/generate-rag` to rebuild the RAG index so that the new conversation embeddings are included in future RAG searches. The `conversation_count` field in the result will reflect the total merged count.
+
+**Error Cases:**
+
+Invalid input:
+```json
+{"type": "error", "message": "conversations must be a non-empty list"}
+```
+
+```json
+{"type": "error", "message": "Each entry in conversations must have 'id' and 'summary' fields"}
+```
+
+Nothing to embed (all already embedded, `force_reembed` = false):
+```json
+{
+  "type": "result",
+  "message": "No new conversations to embed",
+  "data": {
+    "embedded_ids": [],
+    "embedded_count": 0,
+    "skipped_count": 3
+  }
+}
+```
+
+General error:
+```json
+{
+  "type": "error",
+  "message": "Cloud-compact error: <ErrorType>: <details>"
+}
+```
+
+---
+
+### WS /api/scoped-rag-search
+
+Scoped RAG Search endpoint for Cloud AI Deep Chat. Unlike other WebSocket endpoints, this is a **persistent, multi-message connection** — the client can send multiple requests without reconnecting, enabling iterative search (Short Extraction rounds).
+
+**Connection:** `ws://localhost:8000/api/scoped-rag-search`
+
+**Prerequisites:**
+- Storage metadata must be set (`/api/set-storage-metadata`)
+- RAG must be generated (`/api/generate-rag`)
+- Conversations should be compacted for best results (`/api/compact-conversations` or `/api/cloud-compact`)
+
+**Two Actions Available:**
+
+| Action | Purpose |
+|--------|---------|
+| `get_library_context` | Get library tags, conversation keywords, date range, and counts |
+| `scoped_search` | Run date filter → tag filter → FAISS semantic ranking |
+
+**1. Client Connects**
+
+**2. Server Sends Ready:**
+```json
+{
+  "type": "status",
+  "message": "Scoped RAG Search ready."
+}
+```
+
+**3a. Action: `get_library_context`**
+
+Returns the library metadata the cloud AI needs to build its own extraction prompt.
+
+**Request:**
+```json
+{
+  "action": "get_library_context"
+}
+```
+
+**Response:**
+```json
+{
+  "type": "result",
+  "message": "Library context retrieved",
+  "data": {
+    "top_tags": ["beach", "sunset", "family", "vacation", "dogs"],
+    "total_tags": 342,
+    "conv_tags": ["trip planning", "photo editing", "birthday party"],
+    "date_range": {"min": "2023-01-15", "max": "2026-04-10"},
+    "file_count": 1250,
+    "conversation_count": 8
+  }
+}
+```
+
+**Response Data Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `top_tags` | array | Top 200 most common file tags, sorted by frequency |
+| `total_tags` | int | Total number of unique tags across all files |
+| `conv_tags` | array | Keywords extracted from compacted conversation summaries |
+| `date_range` | object | `min` and `max` creation dates across all files |
+| `file_count` | int | Total number of files in the library |
+| `conversation_count` | int | Number of compacted conversations with embeddings |
+
+**3b. Action: `scoped_search`**
+
+Runs date filtering (files only), tag filtering, and FAISS semantic ranking. Returns structured candidate data.
+
+**Request:**
+```json
+{
+  "action": "scoped_search",
+  "rag_query": "beach vacation photos with family",
+  "start_date": "2025-06-01",
+  "end_date": "2025-06-30",
+  "tags": ["beach", "family", "vacation"],
+  "k": 8,
+  "embedding_model": null
+}
+```
+
+**Request Parameters:**
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `action` | string | ✅ | — | Must be `"scoped_search"` |
+| `rag_query` | string | ✅ | — | Semantic search phrase for FAISS ranking |
+| `start_date` | string\|null | ❌ | null | Start date filter (YYYY-MM-DD). **Files only** — conversations are never date-filtered |
+| `end_date` | string\|null | ❌ | null | End date filter (YYYY-MM-DD). **Files only** — conversations are never date-filtered |
+| `tags` | array\|null | ❌ | null | Tag filter applied to both files and conversations |
+| `k` | int | ❌ | 8 | Max candidates to return (capped at 20) |
+| `embedding_model` | string\|null | ❌ | config default | Override embedding model for this search |
+
+**Important:** Conversation candidates (compacted chat summaries) are **exempt from date filtering**. They always participate in tag filtering and semantic ranking regardless of date range.
+
+**Status Messages:**
+```json
+{"type": "status", "message": "Filtering candidates..."}
+{"type": "status", "message": "Date filter: 45 file(s) (2025-06-01 to 2025-06-30)"}
+{"type": "status", "message": "Semantic ranking 45 file(s) + 8 conversation(s)..."}
+```
+
+**Response:**
+```json
+{
+  "type": "result",
+  "message": "Found 8 candidate(s)",
+  "data": {
+    "candidates": [
+      {
+        "type": "file",
+        "fileName": "IMG_2847.jpg",
+        "creationTime": "2025-06-15T10:30:00Z",
+        "tags": ["beach", "family", "summer"],
+        "description": "Family playing on sandy beach with ocean in background",
+        "fileType": "image",
+        "formatted": "• IMG_2847.jpg\n  Date: 2025-06-15\n  Tags: beach, family, summer\n  Desc: Family playing on sandy beach..."
+      },
+      {
+        "type": "conversation",
+        "id": "conv_20250610",
+        "summary": "Discussed planning a beach vacation to Malibu in June...",
+        "tags": ["beach", "vacation", "malibu"],
+        "compacted_at": "2025-06-20T14:00:00Z",
+        "formatted": "• [Conversation conv_20250610]\n  Compacted: 2025-06-20\n  Keywords: beach, vacation, malibu\n  Facts: Discussed planning a beach vacation..."
+      }
+    ],
+    "file_count": 6,
+    "conv_count": 2
+  }
+}
+```
+
+**Candidate Fields (type: file):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | Always `"file"` |
+| `fileName` | string | File name |
+| `creationTime` | string | ISO datetime of file creation |
+| `tags` | array | Tags assigned to the file |
+| `description` | string\|null | AI-generated description |
+| `fileType` | string | `"image"` or `"video"` |
+| `formatted` | string | Pre-formatted text block for LLM context injection |
+
+**Candidate Fields (type: conversation):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | Always `"conversation"` |
+| `id` | string | Conversation ID |
+| `summary` | string | Compacted conversation summary |
+| `tags` | array | Keywords extracted from the summary |
+| `compacted_at` | string | ISO datetime of compaction |
+| `formatted` | string | Pre-formatted text block for LLM context injection |
+
+**4. Client Can Send More Requests**
+
+The connection stays open. Send additional `scoped_search` or `get_library_context` messages without reconnecting. This enables iterative Short Extraction rounds.
+
+**5. Connection Closes**
+
+The client can disconnect at any time. The server cleans up automatically.
+
+**Error Cases:**
+
+```json
+{
+  "type": "error",
+  "message": "RAG database not available. Generate RAG first using /generate-rag."
+}
+```
+
+```json
+{
+  "type": "error",
+  "message": "rag_query is required."
+}
+```
+
+```json
+{
+  "type": "error",
+  "message": "Unknown action: foo. Use 'get_library_context' or 'scoped_search'."
+}
+```
+
+```json
+{
+  "type": "error",
+  "message": "Scoped RAG search error: <ErrorType>: <details>",
+  "data": {"error_type": "...", "error_message": "...", "traceback": "..."}
+}
+```
+
+---
+
 ## Error Handling
 
 All endpoints follow consistent error handling:
@@ -2874,10 +3450,13 @@ Currently no rate limits are enforced. Future versions may add:
 8. **Connection cleanup:** Always close WebSocket connections properly
 9. **Face recognition:** Use similarity thresholds appropriately (0.4-0.6 range recommended)
 10. **Structured output:** Parse XML tags (`<think>`, `<conclusion>`, `<files>`) from chat, tag, and describe responses
+11. **Conversation memory:** Use `/api/compact-conversations` followed by `/api/generate-rag` to build conversation memories into the RAG index
+12. **Cloud AI workflow:** Use `/api/cloud-compact` when your client app performs summarization via a cloud LLM — the server embeds only, no local chat model required
+13. **Cloud Deep Chat:** Use `/api/scoped-rag-search` to let a cloud AI perform Deep Chat — see the [Deep Chat Cloud Build Guide](Documentation/DEEP_CHAT_CLOUD_GUIDE.md)
 
 ---
 
 ## Version
 
-API Version: 2.0  
-Documentation Last Updated: October 25, 2025
+API Version: 3.1  
+Documentation Last Updated: April 12, 2026

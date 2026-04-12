@@ -121,3 +121,11 @@ class SetModelOptionsRequest(BaseModel):
         description="List of model options to set on the server"
     )
 
+
+class CompactConversationsRequest(BaseModel):
+    """Request to compact (summarize) conversations."""
+    count: int = Field(..., ge=1, description="Number of conversations to compact")
+    force_recompact: bool = Field(False, description="Re-compact already-compacted conversations")
+    chat_model: Optional[str] = Field(None, description="Chat model override for summarization")
+    embedding_model: Optional[str] = Field(None, description="Embedding model override")
+
