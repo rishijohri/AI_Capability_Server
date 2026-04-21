@@ -32,6 +32,10 @@ class ConfigResponse(BaseModel):
     binary_config: str = Field(..., description="Selected binary configuration folder")
     system_info: Dict[str, str] = Field(..., description="Detected system information")
     available_binary_configs: list[str] = Field(..., description="List of available binary configurations")
+    tool_history_max_tags: int = Field(..., description="Number of tags kept when truncating scoped_rag_search results in tool call history")
+    tool_history_max_results: int = Field(..., description="Number of results kept when truncating other MCP tool results in tool call history")
+    max_tags_per_scope: int = Field(..., description="Maximum unique tags returned by get_scoped_tags per call")
+    max_dates_per_scope: int = Field(..., description="Maximum date ranges returned by get_scoped_dates per call")
 
 
 class StatusResponse(BaseModel):

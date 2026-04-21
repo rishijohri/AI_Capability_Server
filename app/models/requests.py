@@ -28,6 +28,10 @@ class ConfigUpdateRequest(BaseModel):
     llm_params: Optional[Dict[str, Any]] = None
     binary_config: Optional[str] = Field(None, description="Binary configuration folder name (e.g., 'llama-mac-arm64', 'llama-win-vulkan-x64')")
     model_directory: Optional[str] = Field(None, description="Custom model directory path (absolute path)")
+    tool_history_max_tags: Optional[int] = Field(None, ge=1, description="Number of tags kept when truncating scoped_rag_search results in tool call history")
+    tool_history_max_results: Optional[int] = Field(None, ge=1, description="Number of results kept when truncating other MCP tool results in tool call history")
+    max_tags_per_scope: Optional[int] = Field(None, ge=1, description="Maximum unique tags returned by get_scoped_tags per call")
+    max_dates_per_scope: Optional[int] = Field(None, ge=1, description="Maximum date ranges returned by get_scoped_dates per call")
 
 
 class StorageMetadataRequest(BaseModel):

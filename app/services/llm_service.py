@@ -132,7 +132,11 @@ class LlamaServerBackend(LLMBackend):
             mmproj_path = config.get_model_path(kwargs["mmproj"])
             if mmproj_path.exists():
                 command.extend(["--mmproj", str(mmproj_path)])
-        
+
+        # Enable thinking mode if requested (deep chat only)
+        if kwargs.get("enable_thinking", False):
+            command.extend(["--chat-template-kwargs", '{"enable_thinking":true}'])
+
         # Add any additional arguments
         for key, value in kwargs.items():
             if key.startswith("--") and key != "--mmproj":

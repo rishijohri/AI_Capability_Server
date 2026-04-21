@@ -1,17 +1,35 @@
-"""MCP Tool Registry — OpenAI-format tool definitions and execution for MCP chat mode."""
+"""MCP Tool Registry — 4 focused tools for deep-chat OpenAI tool-calling loop.
 
-import json
+Tools:
+    get_scoped_tags      — List top-M tags from a date/tag-scoped subset of the library.
+    scoped_rag_search    — Semantic search within a date/tag-scoped subset.
+    get_scoped_dates     — List contiguous date ranges that have matching files.
+    get_conversation_rag — Semantic search across compacted conversation summaries.
+
+Each tool result is a plain string.  The handler appends a budget annotation
+"[Tool calls remaining: N]" before returning the result to the LLM.
+"""
+
+import asyncio
 import logging
-from datetime import datetime
-from typing import Any, Dict, List, Optional
 from collections import Counter
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 
-from app.models.metadata import MetadataStore
+from app.models.metadata import FileMetadata
+from app.services.mcp_filters import (
+    ConversationCandidate,
+    filter_by_date,
+    filter_by_tags,
+    get_tags_from_candidates,
+    scoped_rag_search,
+)
 
 logger = logging.getLogger(__name__)
 
-# Maximum characters in a tool result to protect context window (ctx_size ~6500)
-MAX_RESULT_CHARS = 2000
+# Maximum characters in a single tool result
+MAX_RESULT_CHARS = 3000
+
 
 
 def _truncate(text: str, limit: int = MAX_RESULT_CHARS) -> str:
@@ -20,486 +38,513 @@ def _truncate(text: str, limit: int = MAX_RESULT_CHARS) -> str:
     return text[:limit] + "\n... (truncated)"
 
 
-def _format_file_entry(meta) -> str:
-    """Format a single FileMetadata into a concise text block."""
-    lines = [f"- {meta.fileName}"]
-    if hasattr(meta, 'type') and meta.type:
-        lines[0] += f"  [{meta.type}]"
-    if hasattr(meta, 'creationTime') and meta.creationTime:
-        lines.append(f"  Created: {meta.creationTime}")
-    if meta.tags:
-        lines.append(f"  Tags: {', '.join(meta.tags)}")
-    desc = getattr(meta, 'description', None)
-    if desc:
-        short = desc[:200] + "..." if len(desc) > 200 else desc
-        lines.append(f"  Description: {short}")
-    return "\n".join(lines)
-
+# ---------------------------------------------------------------------------
+# MCPToolRegistry
+# ---------------------------------------------------------------------------
 
 class MCPToolRegistry:
-    """Provides OpenAI-format tool definitions and executes tool calls against local services."""
+    """Provides OpenAI-format tool definitions and executes MCP tool calls."""
 
     def __init__(
         self,
-        metadata_store: MetadataStore,
-        rag_service=None,
+        metadata_store,
         llm_service=None,
-        face_service=None,
-        embedding_loaded: bool = False,
-        rag_available: bool = False,
-        chat_model: str = "",
         embedding_model: str = "",
-        mmproj_file: str = "",
+        chat_model: str = "",
+        compaction_service=None,
+        config=None,
     ):
         self.metadata_store = metadata_store
-        self.rag_service = rag_service
         self.llm_service = llm_service
-        self.face_service = face_service
-        self.embedding_loaded = embedding_loaded
-        self.rag_available = rag_available
-        self.chat_model = chat_model
         self.embedding_model = embedding_model
-        self.mmproj_file = mmproj_file
+        self.chat_model = chat_model
+        self.compaction_service = compaction_service
+        self.config = config
 
-        # Map tool name → handler
-        self._handlers = {
-            "search_media": self._search_media,
-            "search_by_person": self._search_by_person,
-            "search_by_location": self._search_by_location,
-            "search_by_tags": self._search_by_tags,
-            "search_by_date_range": self._search_by_date_range,
-            "get_file_info": self._get_file_info,
-            "list_known_people": self._list_known_people,
-            "list_known_locations": self._list_known_locations,
-            "get_library_stats": self._get_library_stats,
-        }
+        # ---------------------------------------------------------------------------
+        # Tool registry — single source of truth for both schemas and handlers.
+        # To add a new MCP tool: implement a handler method below, then append one
+        # entry here with its OpenAI-format schema and a reference to the handler.
+        # Both /api/mcp and /api/deep-chat pick it up automatically.
+        # ---------------------------------------------------------------------------
+        self._registry: List[Dict[str, Any]] = [
+            {
+                "schema": {
+                    "type": "function",
+                    "function": {
+                        "name": "get_scoped_tags",
+                        "description": (
+                            "List the most common tags from files that match an optional date range "
+                            "and/or tag filter. Use this first to understand what the library contains "
+                            "within a scope before running a semantic search."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "start_date": {
+                                    "type": "string",
+                                    "description": "Inclusive start date (YYYY-MM-DD). Omit for no lower bound.",
+                                },
+                                "end_date": {
+                                    "type": "string",
+                                    "description": "Inclusive end date (YYYY-MM-DD). Omit for no upper bound.",
+                                },
+                                "min_tags": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Optional list of tags to pre-filter. Only files that match at least one of these tags are counted.",
+                                },
+                                "strict": {
+                                    "type": "boolean",
+                                    "description": "When true, a file must match ALL tags in min_tags (AND logic). When false (default), matching ANY single tag is sufficient (OR logic); results are ranked by number of matching tags.",
+                                },
+                                "top_m": {
+                                    "type": "integer",
+                                    "description": "Maximum number of tags to return (default 50).",
+                                },
+                            },
+                            "required": [],
+                        },
+                    },
+                },
+                "handler": self._get_scoped_tags,
+            },
+            {
+                "schema": {
+                    "type": "function",
+                    "function": {
+                        "name": "scoped_rag_search",
+                        "description": (
+                            "Semantic search for media files within a mandatory date and tag scope. "
+                            "You MUST supply both a date range (start_date + end_date) AND at least "
+                            "one tag in min_tags before calling this tool. Use get_scoped_dates and "
+                            "get_scoped_tags first to discover valid values. Returns the top-K most "
+                            "relevant files for the query within that scope."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "Natural language search query describing what to find.",
+                                },
+                                "start_date": {
+                                    "type": "string",
+                                    "description": "Inclusive start date (YYYY-MM-DD). Required — obtain from get_scoped_dates first.",
+                                },
+                                "end_date": {
+                                    "type": "string",
+                                    "description": "Inclusive end date (YYYY-MM-DD). Required — obtain from get_scoped_dates first.",
+                                },
+                                "min_tags": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Required tag filter. Provide at least one tag — obtain from get_scoped_tags first.",
+                                },
+                                "strict": {
+                                    "type": "boolean",
+                                    "description": "When true, files must match ALL tags in min_tags (AND logic). When false (default), matching ANY single tag is sufficient (OR logic); results are ranked by number of matching tags.",
+                                },
+                                "top_k": {
+                                    "type": "integer",
+                                    "description": "Number of results to return (default from config top_k).",
+                                },
+                            },
+                            "required": ["query", "start_date", "end_date", "min_tags"],
+                        },
+                    },
+                },
+                "handler": self._scoped_rag_search,
+            },
+            {
+                "schema": {
+                    "type": "function",
+                    "function": {
+                        "name": "get_scoped_dates",
+                        "description": (
+                            "List the contiguous date ranges that contain matching files, sorted by "
+                            "file count. Use this to understand the temporal distribution of the "
+                            "library or a scoped subset. Helps identify when events happened."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "start_date": {
+                                    "type": "string",
+                                    "description": "Restrict to files on or after this date (YYYY-MM-DD). Omit for no lower bound.",
+                                },
+                                "end_date": {
+                                    "type": "string",
+                                    "description": "Restrict to files on or before this date (YYYY-MM-DD). Omit for no upper bound.",
+                                },
+                                "min_tags": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Optional tag filter applied before date grouping.",
+                                },
+                                "strict": {
+                                    "type": "boolean",
+                                    "description": "When true, files must match ALL tags in min_tags (AND logic). When false (default), matching ANY single tag is sufficient (OR logic); results are ranked by number of matching tags.",
+                                },
+                                "top_k": {
+                                    "type": "integer",
+                                    "description": "Maximum number of date ranges to return (default 10).",
+                                },
+                            },
+                            "required": [],
+                        },
+                    },
+                },
+                "handler": self._get_scoped_dates,
+            },
+            {
+                "schema": {
+                    "type": "function",
+                    "function": {
+                        "name": "get_conversation_rag",
+                        "description": (
+                            "Semantic search across compacted past conversation summaries. "
+                            "Use this to find relevant facts, preferences, or events that were "
+                            "discussed in previous conversations but may not appear as media files."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "Natural language query describing what to find in past conversations.",
+                                },
+                                "top_n": {
+                                    "type": "integer",
+                                    "description": "Number of conversation snippets to return (default 5).",
+                                },
+                            },
+                            "required": ["query"],
+                        },
+                    },
+                },
+                "handler": self._get_conversation_rag,
+            },
+        ]
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def get_tool_definitions(self) -> List[Dict[str, Any]]:
-        """Return OpenAI-format tool definitions list."""
-        tools: List[Dict[str, Any]] = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "search_media",
-                    "description": "Semantic search across the media library using natural language. Finds files whose tags/descriptions are semantically similar to the query.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string", "description": "Natural language search query"},
-                            "count": {"type": "integer", "description": "Number of results (default 5, max 20)", "default": 5},
-                        },
-                        "required": ["query"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "search_by_person",
-                    "description": "Find all files containing a specific person (matched by person: tag prefix).",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "person_name": {"type": "string", "description": "Person name or face ID to search for"},
-                        },
-                        "required": ["person_name"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "search_by_location",
-                    "description": "Find files from a specific city or country (matched by city: or country: tag prefix).",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "location": {"type": "string", "description": "City or country name"},
-                            "location_type": {
-                                "type": "string",
-                                "enum": ["city", "country", "any"],
-                                "description": "Filter by city, country, or any location type (default: any)",
-                                "default": "any",
-                            },
-                        },
-                        "required": ["location"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "search_by_tags",
-                    "description": "Find files matching specific tag keywords (substring match on tags). Can require all tags to match or any.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "tags": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "List of tag keywords to search for",
-                            },
-                            "match_all": {
-                                "type": "boolean",
-                                "description": "If true, all tags must match; if false, any tag matches (default: false)",
-                                "default": False,
-                            },
-                        },
-                        "required": ["tags"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "search_by_date_range",
-                    "description": "Find files created within a date range.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "start_date": {"type": "string", "description": "Start date in ISO format (e.g. 2024-01-01)"},
-                            "end_date": {"type": "string", "description": "End date in ISO format (e.g. 2024-12-31)"},
-                        },
-                        "required": ["start_date", "end_date"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_file_info",
-                    "description": "Get detailed metadata for a specific file including all tags, description, dates, and extra fields.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "filename": {"type": "string", "description": "Exact filename to look up"},
-                        },
-                        "required": ["filename"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "list_known_people",
-                    "description": "List all known people appearing in the library (from person: tags), with file counts.",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "list_known_locations",
-                    "description": "List all known cities and countries in the library (from city: and country: tags), with file counts.",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_library_stats",
-                    "description": "Get overall statistics about the media library: total files, type breakdown, date range, top tags/people/locations.",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            },
-        ]
-        return tools
+    def get_tool_definitions(self, only_rag: bool = False) -> List[Dict[str, Any]]:
+        """Return OpenAI-format tool definitions.
 
-    async def execute_tool(self, name: str, arguments: Dict[str, Any]) -> str:
-        """Execute a tool by name with given arguments. Returns result text."""
-        handler = self._handlers.get(name)
-        if handler is None:
-            return f"Error: Unknown tool '{name}'"
+        Args:
+            only_rag: When True, return only ``scoped_rag_search`` (used when
+                      budget == 1 to force a final targeted search).
+        """
+        if only_rag:
+            return [
+                e["schema"] for e in self._registry
+                if e["schema"]["function"]["name"] == "scoped_rag_search"
+            ]
+        return [e["schema"] for e in self._registry]
+
+    async def execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
+        """Execute a tool by name and return its string result.
+
+        Args:
+            tool_name: Name of the tool to call.
+            arguments: Parsed JSON arguments dict.
+
+        Returns:
+            Plain-text result string (truncated to MAX_RESULT_CHARS).
+        """
+        entry = next(
+            (e for e in self._registry if e["schema"]["function"]["name"] == tool_name),
+            None,
+        )
+        if entry is None:
+            return f"Unknown tool: {tool_name}"
         try:
-            result = await handler(arguments)
+            result = await entry["handler"](**arguments)
             return _truncate(result)
-        except Exception as e:
-            logger.error(f"MCP tool '{name}' failed: {e}", exc_info=True)
-            return f"Error executing {name}: {str(e)}"
+        except Exception as exc:
+            logger.error(f"Tool {tool_name} failed: {exc}", exc_info=True)
+            return f"Tool error ({tool_name}): {exc}"
 
     # ------------------------------------------------------------------
     # Tool implementations
     # ------------------------------------------------------------------
 
-    async def _swap_to_embedding(self) -> None:
-        """Swap to embedding model for RAG/knowledge searches."""
-        if self.llm_service and self.embedding_model:
-            await self.llm_service.load_model(self.embedding_model)
+    async def _get_scoped_tags(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        min_tags: Optional[List[str]] = None,
+        strict: bool = False,
+        top_m: Optional[int] = None,
+    ) -> str:
+        """Implement get_scoped_tags."""
+        effective_top_m: int = (
+            top_m
+            if top_m is not None
+            else (getattr(self.config, "max_tags_per_scope", 50) if self.config else 50)
+        )
 
-    async def _restore_chat_model(self) -> None:
-        """Restore chat model after embedding search."""
-        if self.llm_service and self.chat_model:
-            if self.mmproj_file:
-                await self.llm_service.load_model(self.chat_model, mmproj=self.mmproj_file)
+        all_meta: List[FileMetadata] = self.metadata_store.get_all_metadata()
+        candidates: List[Any] = list(all_meta)
+
+        if start_date and end_date:
+            date_filtered = filter_by_date(all_meta, start_date, end_date)
+            if date_filtered:
+                candidates = date_filtered
             else:
-                await self.llm_service.load_model(self.chat_model)
+                return f"No files found between {start_date} and {end_date}."
+        elif start_date:
+            date_filtered = filter_by_date(all_meta, start_date, start_date)
+            if date_filtered:
+                candidates = date_filtered
 
-    async def _search_media(self, args: Dict[str, Any]) -> str:
-        query = args.get("query", "")
-        count = min(int(args.get("count", 5)), 20)
+        if min_tags:
+            tag_filtered = filter_by_tags(candidates, min_tags, strict=strict)
+            if tag_filtered:
+                candidates = tag_filtered
 
-        if not self.rag_service or not self.rag_available:
-            return "Media search is not available (RAG not loaded)."
+        if not candidates:
+            return "No files matched the specified scope."
 
-        # Swap to embedding model for semantic search
-        await self._swap_to_embedding()
-        try:
-            results = await self.rag_service.search(query, k=count)
-        finally:
-            # Always restore chat model
-            await self._restore_chat_model()
+        tag_counter: Counter = Counter()
+        for c in candidates:
+            for tag in c.tags:
+                tag_counter[tag.lower()] += 1
+
+        top_tags = tag_counter.most_common(effective_top_m)
+        if not top_tags:
+            return f"Found {len(candidates)} file(s) in scope but none have tags."
+
+        lines = [f"Top {len(top_tags)} tags from {len(candidates)} file(s) in scope:"]
+        for tag, count in top_tags:
+            lines.append(f"  {tag}: {count}")
+        return "\n".join(lines)
+
+    async def _scoped_rag_search(
+        self,
+        query: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        min_tags: Optional[List[str]] = None,
+        strict: bool = False,
+        top_k: Optional[int] = None,
+    ) -> str:
+        """Implement scoped_rag_search."""
+        effective_top_k: int = (
+            top_k
+            if top_k is not None
+            else (getattr(self.config, "top_k", 5) if self.config else 5)
+        )
+
+        all_meta: List[FileMetadata] = self.metadata_store.get_all_metadata()
+        candidates: List[Any] = list(all_meta)
+
+        if start_date and end_date:
+            date_filtered = filter_by_date(all_meta, start_date, end_date)
+            if date_filtered:
+                candidates = date_filtered
+            else:
+                return f"No files found between {start_date} and {end_date}."
+        elif start_date:
+            date_filtered = filter_by_date(all_meta, start_date, start_date)
+            if date_filtered:
+                candidates = date_filtered
+
+        if min_tags:
+            tag_filtered = filter_by_tags(candidates, min_tags, strict=strict)
+            if tag_filtered:
+                candidates = tag_filtered
+
+        if not candidates:
+            return "No files matched the specified scope."
+
+        logger.info(f"scoped_rag_search: {len(candidates)} candidates, query='{query[:80]}'")
+
+        results = await scoped_rag_search(
+            filtered_candidates=candidates,
+            query=query,
+            k=effective_top_k,
+            llm_service=self.llm_service,
+            embedding_model=self.embedding_model,
+            metadata_store=self.metadata_store,
+            compaction_service=self.compaction_service,
+        )
+
+        if self.chat_model and self.llm_service:
+            await self.llm_service.load_model(self.chat_model)
 
         if not results:
-            return f"No files found matching '{query}'."
+            return "No matching files found for the query."
 
         lines = [f"Found {len(results)} file(s) matching '{query}':"]
-        for meta in results:
-            lines.append(_format_file_entry(meta))
-        return "\n".join(lines)
-
-    async def _search_by_person(self, args: Dict[str, Any]) -> str:
-        person_name = args.get("person_name", "").strip()
-        if not person_name:
-            return "Error: person_name is required."
-
-        all_meta = self.metadata_store.get_all_metadata()
-        needle = person_name.lower()
-        matches = []
-        for meta in all_meta:
-            for tag in meta.tags:
-                tag_lower = tag.lower()
-                if tag_lower.startswith("person:") and needle in tag_lower[len("person:"):]:
-                    matches.append(meta)
-                    break
-
-        if not matches:
-            return f"No files found for person '{person_name}'."
-
-        # Sort by creation date descending
-        matches.sort(key=lambda m: m.creationTime or "", reverse=True)
-        lines = [f"Found {len(matches)} file(s) with person '{person_name}':"]
-        for meta in matches[:30]:
-            lines.append(_format_file_entry(meta))
-        if len(matches) > 30:
-            lines.append(f"... and {len(matches) - 30} more files.")
-        return "\n".join(lines)
-
-    async def _search_by_location(self, args: Dict[str, Any]) -> str:
-        location = args.get("location", "").strip()
-        loc_type = args.get("location_type", "any").lower()
-        if not location:
-            return "Error: location is required."
-
-        all_meta = self.metadata_store.get_all_metadata()
-        needle = location.lower()
-        matches = []
-        for meta in all_meta:
-            for tag in meta.tags:
-                tag_lower = tag.lower()
-                if loc_type == "city" and tag_lower.startswith("city:") and needle in tag_lower[len("city:"):]:
-                    matches.append(meta)
-                    break
-                elif loc_type == "country" and tag_lower.startswith("country:") and needle in tag_lower[len("country:"):]:
-                    matches.append(meta)
-                    break
-                elif loc_type == "any":
-                    if (tag_lower.startswith("city:") and needle in tag_lower[len("city:"):]) or \
-                       (tag_lower.startswith("country:") and needle in tag_lower[len("country:"):]):
-                        matches.append(meta)
-                        break
-
-        if not matches:
-            return f"No files found for location '{location}'."
-
-        matches.sort(key=lambda m: m.creationTime or "", reverse=True)
-        lines = [f"Found {len(matches)} file(s) from '{location}':"]
-        for meta in matches[:30]:
-            lines.append(_format_file_entry(meta))
-        if len(matches) > 30:
-            lines.append(f"... and {len(matches) - 30} more files.")
-        return "\n".join(lines)
-
-    async def _search_by_tags(self, args: Dict[str, Any]) -> str:
-        tags = args.get("tags", [])
-        match_all = args.get("match_all", False)
-        if not tags:
-            return "Error: tags list is required."
-
-        all_meta = self.metadata_store.get_all_metadata()
-        needles = [t.lower() for t in tags]
-        matches = []
-        for meta in all_meta:
-            meta_tags_lower = [t.lower() for t in meta.tags]
-            if match_all:
-                if all(any(n in mt for mt in meta_tags_lower) for n in needles):
-                    matches.append(meta)
+        for r in results:
+            if isinstance(r, ConversationCandidate):
+                lines.append(f"\n[Conversation {r.conv_id}]")
+                if r.compacted_at:
+                    lines.append(f"  Compacted: {r.compacted_at[:10]}")
+                if r.tags:
+                    lines.append(f"  Keywords: {', '.join(r.tags[:10])}")
+                if r.summary:
+                    preview = r.summary[:250] + "..." if len(r.summary) > 250 else r.summary
+                    lines.append(f"  Summary: {preview}")
             else:
-                if any(any(n in mt for mt in meta_tags_lower) for n in needles):
-                    matches.append(meta)
+                lines.append(f"\n- {r.fileName}")
+                if r.creationTime:
+                    lines.append(f"  Date: {r.creationTime[:10]}")
+                if r.tags:
+                    lines.append(f"  Tags: {', '.join(r.tags[:12])}")
+                if r.description:
+                    desc = r.description[:200] + "..." if len(r.description) > 200 else r.description
+                    lines.append(f"  Description: {desc}")
+                if r.type:
+                    lines.append(f"  Type: {r.type}")
 
-        if not matches:
-            return f"No files found matching tags: {', '.join(tags)}."
-
-        matches.sort(key=lambda m: m.creationTime or "", reverse=True)
-        lines = [f"Found {len(matches)} file(s) matching tags [{', '.join(tags)}] (match_all={match_all}):"]
-        for meta in matches[:30]:
-            lines.append(_format_file_entry(meta))
-        if len(matches) > 30:
-            lines.append(f"... and {len(matches) - 30} more files.")
         return "\n".join(lines)
 
-    async def _search_by_date_range(self, args: Dict[str, Any]) -> str:
-        start_str = args.get("start_date", "")
-        end_str = args.get("end_date", "")
-        if not start_str or not end_str:
-            return "Error: start_date and end_date are required."
+    async def _get_scoped_dates(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        min_tags: Optional[List[str]] = None,
+        strict: bool = False,
+        top_k: Optional[int] = None,
+    ) -> str:
+        """Implement get_scoped_dates."""
+        effective_top_k: int = (
+            top_k
+            if top_k is not None
+            else (getattr(self.config, "max_dates_per_scope", 10) if self.config else 10)
+        )
 
-        try:
-            start_dt = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
-        except ValueError:
-            return f"Error: Invalid start_date format '{start_str}'. Use ISO format (e.g. 2024-01-01)."
-        try:
-            end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
-        except ValueError:
-            return f"Error: Invalid end_date format '{end_str}'. Use ISO format (e.g. 2024-12-31)."
+        all_meta: List[FileMetadata] = self.metadata_store.get_all_metadata()
+        candidates: List[Any] = list(all_meta)
 
-        all_meta = self.metadata_store.get_all_metadata()
-        matches = []
-        for meta in all_meta:
-            ct = meta.creationTime
-            if not ct:
-                continue
+        if start_date and end_date:
+            date_filtered = filter_by_date(all_meta, start_date, end_date)
+            if date_filtered:
+                candidates = date_filtered
+
+        if min_tags:
+            tag_filtered = filter_by_tags(candidates, min_tags, strict=strict)
+            if tag_filtered:
+                candidates = tag_filtered
+
+        if not candidates:
+            return "No files matched the specified scope."
+
+        dated: List[datetime] = []
+        for c in candidates:
             try:
-                file_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+                ct = c.creationTime
+                if ct:
+                    dt = datetime.fromisoformat(ct.replace("Z", "+00:00")).replace(tzinfo=None)
+                    dated.append(dt)
             except (ValueError, AttributeError):
                 continue
-            # Compare as naive if timezones are mixed
-            if start_dt.tzinfo and not file_dt.tzinfo:
-                start_cmp = start_dt.replace(tzinfo=None)
-                end_cmp = end_dt.replace(tzinfo=None)
-            elif file_dt.tzinfo and not start_dt.tzinfo:
-                file_dt = file_dt.replace(tzinfo=None)
-                start_cmp = start_dt
-                end_cmp = end_dt
+
+        if not dated:
+            return f"Found {len(candidates)} file(s) but none have parseable dates."
+
+        dated.sort()
+
+        ranges: List[Dict[str, Any]] = []
+        range_start = dated[0].date()
+        range_end = dated[0].date()
+        count = 1
+
+        for dt in dated[1:]:
+            d = dt.date()
+            gap = (d - range_end).days
+            if gap <= 1:
+                range_end = d
+                count += 1
             else:
-                start_cmp = start_dt
-                end_cmp = end_dt
-            if start_cmp <= file_dt <= end_cmp:
-                matches.append(meta)
+                ranges.append({"start": str(range_start), "end": str(range_end), "file_count": count})
+                range_start = d
+                range_end = d
+                count = 1
 
-        if not matches:
-            return f"No files found between {start_str} and {end_str}."
+        ranges.append({"start": str(range_start), "end": str(range_end), "file_count": count})
+        ranges.sort(key=lambda r: r["file_count"], reverse=True)
+        top_ranges = ranges[:effective_top_k]
 
-        matches.sort(key=lambda m: m.creationTime or "")
-        lines = [f"Found {len(matches)} file(s) between {start_str} and {end_str}:"]
-        for meta in matches[:30]:
-            lines.append(_format_file_entry(meta))
-        if len(matches) > 30:
-            lines.append(f"... and {len(matches) - 30} more files.")
+        lines = [
+            f"Top {len(top_ranges)} date range(s) by file count "
+            f"(from {len(candidates)} matching files):"
+        ]
+        for r in top_ranges:
+            if r["start"] == r["end"]:
+                lines.append(f"  {r['start']} — {r['file_count']} file(s)")
+            else:
+                lines.append(f"  {r['start']} to {r['end']} — {r['file_count']} file(s)")
         return "\n".join(lines)
 
-    async def _get_file_info(self, args: Dict[str, Any]) -> str:
-        filename = args.get("filename", "").strip()
-        if not filename:
-            return "Error: filename is required."
+    async def _get_conversation_rag(
+        self,
+        query: str,
+        top_n: Optional[int] = None,
+    ) -> str:
+        """Implement get_conversation_rag."""
+        effective_top_n: int = (
+            top_n
+            if top_n is not None
+            else (getattr(self.config, "top_k", 5) if self.config else 5)
+        )
 
-        meta = self.metadata_store.get_metadata_by_filename(filename)
-        if meta is None:
-            return f"File '{filename}' not found in the library."
+        if self.compaction_service is None:
+            return "Conversation compaction service is not available."
 
-        return meta.to_text_representation()
+        if not self.compaction_service.is_loaded():
+            self.compaction_service.load()
 
-    async def _list_known_people(self, _args: Dict[str, Any]) -> str:
-        all_meta = self.metadata_store.get_all_metadata()
-        person_counter: Counter = Counter()
-        for meta in all_meta:
-            for tag in meta.tags:
-                if tag.lower().startswith("person:"):
-                    name = tag[len("person:"):]
-                    person_counter[name] += 1
+        all_data = self.compaction_service.get_all_data()
+        if not all_data:
+            return "No compacted conversations found."
 
-        if not person_counter:
-            return "No known people found in the library."
+        candidates: List[ConversationCandidate] = [
+            ConversationCandidate(
+                conv_id=cid,
+                summary=d.get("summary", ""),
+                tags=d.get("tags", []),
+                compacted_at=d.get("compactedAt", ""),
+            )
+            for cid, d in all_data.items()
+            if d.get("embedding")
+        ]
 
-        lines = [f"Known people ({len(person_counter)}):"]
-        for name, count in person_counter.most_common():
-            lines.append(f"- {name}: {count} file(s)")
+        if not candidates:
+            return "No embedded conversations available for search."
+
+        results = await scoped_rag_search(
+            filtered_candidates=candidates,
+            query=query,
+            k=effective_top_n,
+            llm_service=self.llm_service,
+            embedding_model=self.embedding_model,
+            metadata_store=self.metadata_store,
+            compaction_service=self.compaction_service,
+        )
+
+        if self.chat_model and self.llm_service:
+            await self.llm_service.load_model(self.chat_model)
+
+        if not results:
+            return "No relevant past conversations found."
+
+        lines = [f"Found {len(results)} relevant past conversation(s):"]
+        for r in results:
+            if isinstance(r, ConversationCandidate):
+                lines.append(f"\n[Conversation {r.conv_id}]")
+                if r.compacted_at:
+                    lines.append(f"  Compacted: {r.compacted_at[:10]}")
+                if r.tags:
+                    lines.append(f"  Keywords: {', '.join(r.tags[:10])}")
+                if r.summary:
+                    preview = r.summary[:300] + "..." if len(r.summary) > 300 else r.summary
+                    lines.append(f"  Summary: {preview}")
+
         return "\n".join(lines)
-
-    async def _list_known_locations(self, _args: Dict[str, Any]) -> str:
-        all_meta = self.metadata_store.get_all_metadata()
-        city_counter: Counter = Counter()
-        country_counter: Counter = Counter()
-        for meta in all_meta:
-            for tag in meta.tags:
-                tag_lower = tag.lower()
-                if tag_lower.startswith("city:"):
-                    city_counter[tag[len("city:"):]] += 1
-                elif tag_lower.startswith("country:"):
-                    country_counter[tag[len("country:"):]] += 1
-
-        if not city_counter and not country_counter:
-            return "No known locations found in the library."
-
-        lines = []
-        if country_counter:
-            lines.append(f"Countries ({len(country_counter)}):")
-            for name, count in country_counter.most_common():
-                lines.append(f"- {name}: {count} file(s)")
-        if city_counter:
-            lines.append(f"\nCities ({len(city_counter)}):")
-            for name, count in city_counter.most_common():
-                lines.append(f"- {name}: {count} file(s)")
-        return "\n".join(lines)
-
-    async def _get_library_stats(self, _args: Dict[str, Any]) -> str:
-        all_meta = self.metadata_store.get_all_metadata()
-        if not all_meta:
-            return "Library is empty — no files found."
-
-        total = len(all_meta)
-        type_counter: Counter = Counter()
-        tag_counter: Counter = Counter()
-        person_set: set = set()
-        location_set: set = set()
-        dates = []
-
-        for meta in all_meta:
-            file_type = getattr(meta, 'type', 'unknown') or 'unknown'
-            type_counter[file_type] += 1
-            for tag in meta.tags:
-                tag_lower = tag.lower()
-                if tag_lower.startswith("person:"):
-                    person_set.add(tag[len("person:"):])
-                elif tag_lower.startswith("city:") or tag_lower.startswith("country:"):
-                    location_set.add(tag)
-                else:
-                    tag_counter[tag] += 1
-            ct = meta.creationTime
-            if ct:
-                try:
-                    dates.append(datetime.fromisoformat(ct.replace("Z", "+00:00")))
-                except (ValueError, AttributeError):
-                    pass
-
-        lines = [f"Library Statistics:"]
-        lines.append(f"Total files: {total}")
-        lines.append(f"By type: {', '.join(f'{t}: {c}' for t, c in type_counter.most_common())}")
-        if dates:
-            lines.append(f"Date range: {min(dates).strftime('%Y-%m-%d')} to {max(dates).strftime('%Y-%m-%d')}")
-        lines.append(f"Known people: {len(person_set)}")
-        if person_set:
-            lines.append(f"  Names: {', '.join(sorted(person_set)[:20])}")
-        lines.append(f"Known locations: {len(location_set)}")
-        if location_set:
-            lines.append(f"  Places: {', '.join(sorted(location_set)[:20])}")
-        if tag_counter:
-            top_tags = tag_counter.most_common(15)
-            lines.append(f"Top tags: {', '.join(f'{t}({c})' for t, c in top_tags)}")
-        return "\n".join(lines)
-
 

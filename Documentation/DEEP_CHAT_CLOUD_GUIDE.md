@@ -1,31 +1,35 @@
 # Deep Chat (Cloud) Build Guide
 
-Build a Cloud AI client that performs Deep Chat by using the local server's scoped RAG search endpoint. The server handles filtering and semantic ranking; your cloud AI handles reasoning and synthesis.
+Build a Cloud AI client that performs Deep Chat by connecting to the local server's MCP tool endpoint. The server handles filtering, semantic ranking, and prompt construction; your cloud AI handles reasoning and tool selection.
 
 ## Architecture
 
 ```
-┌─────────────────────────┐         ┌──────────────────────────┐
-│     Cloud AI Client     │   WS    │     Local AI Server      │
-│  (GPT-4, Claude, etc.)  │◄───────►│  /api/scoped-rag-search  │
-│                         │         │                          │
-│  1. Extraction prompt   │         │  • Metadata store        │
-│  2. Synthesis prompt    │         │  • FAISS embeddings      │
-│  3. Short Extraction    │         │  • Compacted convos      │
-│                         │         │  • Date/tag filtering    │
-└─────────────────────────┘         └──────────────────────────┘
+┌──────────────────────────────┐         ┌──────────────────────────┐
+│       Cloud AI Client        │   WS    │     Local AI Server      │
+│  (GPT-4, Claude, Gemini …)   │◄───────►│       /api/mcp           │
+│                              │         │                          │
+│  Tool-calling loop           │         │  • System prompt builder │
+│  (standard function calling) │         │  • Library context       │
+│                              │         │  • Metadata store        │
+│  Uses server-provided        │         │  • FAISS embeddings      │
+│  system prompt directly      │         │  • Compacted convos      │
+│                              │         │  • Date/tag filtering    │
+└──────────────────────────────┘         └──────────────────────────┘
 ```
 
-The cloud AI replaces the local LLM for all reasoning steps. The server provides:
-- Library metadata (tags, dates, conversation keywords)
-- Date & tag filtering (files only — conversations always participate)
-- FAISS semantic ranking with stored embeddings
+The cloud AI replaces the local LLM for all reasoning and tool-selection steps. The server provides:
+- A ready-to-use **system prompt** with pre-loaded library context already injected
+- **Tool execution** for all 4 MCP tools (filtering, date exploration, semantic search, conversation search)
+- **Budget annotations** appended to every tool result so the AI tracks remaining calls
+
+Unlike the old approach (custom extraction + synthesis prompts + SHORT_EXTRACTION loop), this design uses **standard LLM function calling** — exactly the same protocol the local deep-chat loop uses. The Cloud AI simply forwards tool calls to the server and feeds results back into its own conversation context.
 
 ---
 
 ## Prerequisites
 
-Before using `/api/scoped-rag-search`, ensure:
+Before using `/api/mcp`, ensure:
 
 1. **Storage metadata is set** — `POST /api/set-storage-metadata`
 2. **Files are tagged/described** — `WS /api/tag` and `WS /api/describe`
@@ -34,32 +38,106 @@ Before using `/api/scoped-rag-search`, ensure:
 
 ---
 
+## The Four MCP Tools
+
+> **Note:** The complete OpenAI-format tool schemas are returned dynamically in `data.tool_definitions` from `get_library_context`. Your client should use those directly rather than hardcoding schemas. The descriptions below are for human reference.
+
+The server exposes exactly four tools. Their parameter names and types are described below.
+
+### 1. `get_scoped_tags`
+
+> List the most common tags from a date/tag-scoped subset of the library.
+
+Use this to understand what topics exist in a time range before running a semantic search.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `start_date` | string (YYYY-MM-DD) | No | Inclusive start date filter |
+| `end_date` | string (YYYY-MM-DD) | No | Inclusive end date filter |
+| `min_tags` | array of strings | No | Pre-filter: only files matching these tags are counted |
+| `strict` | boolean | No | `true` = all tags must match (AND). `false` (default) = any tag matches (OR) |
+| `top_m` | integer | No | How many top tags to return (default 50) |
+
+Returns: Plain text listing the top tags and their frequencies in the scoped subset.
+
+---
+
+### 2. `get_scoped_dates`
+
+> List contiguous date ranges that contain matching files, sorted by file count.
+
+Use this to discover when events occurred or to find the temporal distribution of a topic.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `start_date` | string (YYYY-MM-DD) | No | Restrict to files on or after this date |
+| `end_date` | string (YYYY-MM-DD) | No | Restrict to files on or before this date |
+| `min_tags` | array of strings | No | Tag filter applied before date grouping |
+| `strict` | boolean | No | AND vs OR tag matching (default OR) |
+| `top_k` | integer | No | Maximum number of date clusters to return (default 10) |
+
+Returns: Plain text listing date ranges and file counts.
+
+---
+
+### 3. `scoped_rag_search`
+
+> Semantic search for media files within a mandatory date and tag scope.
+
+**This tool requires all three scoping fields.** The AI must have a concrete date range and at least one tag before calling it — obtain these from `get_scoped_tags` / `get_scoped_dates` first, or from the pre-loaded library context if that is sufficient.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `query` | string | **Yes** | Natural language search phrase |
+| `start_date` | string (YYYY-MM-DD) | **Yes** | Inclusive start date |
+| `end_date` | string (YYYY-MM-DD) | **Yes** | Inclusive end date |
+| `min_tags` | array of strings | **Yes** | At least one tag required |
+| `strict` | boolean | No | AND vs OR tag matching (default OR) |
+| `top_k` | integer | No | Number of results to return |
+
+Returns: Plain text listing the top-K matching files and conversation summaries with name, date, tags, and description for each.
+
+> **Note:** Conversation summaries (from compacted conversations) participate in semantic ranking regardless of the date range. Only file candidates are filtered by date. Conversations always participate in the tag filter and semantic ranking.
+
+---
+
+### 4. `get_conversation_rag`
+
+> Semantic search across compacted past conversation summaries.
+
+Use this when the question involves facts, preferences, or events from previous conversations that may not appear as media files.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `query` | string | **Yes** | Natural language search phrase |
+| `top_n` | integer | No | Number of conversation snippets to return (default 5) |
+
+Returns: Plain text listing matching conversation summaries with their topics and key facts.
+
+---
+
 ## Call Order Summary
 
 ```
-1.  Open persistent WebSocket to /api/scoped-rag-search
-2.  Wait for: {"type": "status", "message": "Scoped RAG Search ready."}
-3.  Send: {"action": "get_library_context"}
-4.  Receive: library tags, conversation keywords, date range, file/conversation counts
-5.  Cloud AI — Extraction call:
-      INPUT:  user question + library context
-      OUTPUT: START_DATE, END_DATE, TAGS, RAG_QUERY
-6.  Send: {"action": "scoped_search", ...extracted params}
-7.  Receive: ranked list of candidate files and conversation summaries
-8.  Cloud AI — Synthesis call:
-      INPUT:  user question + formatted candidates
-      OUTPUT: answer, OR SHORT_EXTRACTION directive if more data needed
-9.  If SHORT_EXTRACTION received:
-      a. Parse: START_DATE, END_DATE, TAGS, RAG_QUERY, INSIGHT
-      b. Append INSIGHT to accumulated insights list
-      c. Send: {"action": "scoped_search", ...new params}
-      d. Receive: new candidates
-      e. Merge new candidates into existing list (deduplicate by fileName / id, cap at 8)
-      f. Cloud AI — Re-synthesis call:
-           INPUT: user question + INSIGHTS block + merged candidates
-           OUTPUT: answer, OR next SHORT_EXTRACTION (repeat from 9a, up to N times)
-10. Strip any remaining SHORT_EXTRACTION directive lines from final response
-11. Return final answer to user
+1.  Open persistent WebSocket to /api/mcp
+2.  Wait for: {"type": "status", "message": "Cloud Deep Chat MCP tools ready."}
+3.  Send: {"action": "get_library_context", "query": "<user question>"}
+4.  Receive: system_prompt (ready to use), library_context, tool_budget, top_tags, date_range, counts
+5.  Use system_prompt directly as the system message for the Cloud AI
+6.  Define the 4 MCP tools as function-calling schemas for the Cloud AI LLM
+7.  Send initial user message to Cloud AI (system + user turn)
+8.  Tool-calling loop:
+      a. Cloud AI responds with one or more tool calls
+      b. For each tool call, send to server:
+            {"action": "<tool_name>", "budget_remaining": <N>, ...tool arguments}
+      c. Receive result — the "message" field contains the tool output with budget annotation appended
+      d. Add result "message" as the tool result in the LLM conversation
+      e. Decrement your local budget counter by 1
+      f. If budget reaches 0, the server annotates: "[Tool calls remaining: 0 — generate your final answer now]"
+      g. On the next LLM call, send no tools (force a plain text response)
+9.  Cloud AI produces a final text answer (no tool calls)
+10. Extract the answer from <conclusion>...</conclusion> tags
+11. Extract referenced file names from <files>...</files> tags
 12. Close WebSocket connection
 ```
 
@@ -69,35 +147,40 @@ Before using `/api/scoped-rag-search`, ensure:
 
 ### Step 1 — Open the Connection
 
-Open a WebSocket to `ws://localhost:8000/api/scoped-rag-search`.
+Open a WebSocket to `ws://localhost:8000/api/mcp`.
 
 Wait for the first message from the server:
 
 ```json
-{"type": "status", "message": "Scoped RAG Search ready."}
+{"type": "status", "message": "Cloud Deep Chat MCP tools ready."}
 ```
 
-The connection stays open for the entire conversation. Multiple actions (library context requests, scoped searches) can be sent over the same connection without reconnecting.
+The connection stays open for the entire session. All tool calls for a single conversation use the same connection.
 
 ---
 
-### Step 2 — Get Library Context
+### Step 2 — Get Library Context and System Prompt
 
-Send:
+Send the user's question so the server can pre-load relevant conversation memory:
+
 ```json
-{"action": "get_library_context"}
+{"action": "get_library_context", "query": "<user question>"}
 ```
 
 Receive:
+
 ```json
 {
   "type": "result",
+  "message": "Library context retrieved",
   "data": {
-    "top_tags": ["beach", "sunset", "family", ...],
-    "total_tags": 342,
-    "conv_tags": ["trip planning", "photo editing", ...],
+    "system_prompt": "You are Persona, a thorough AI assistant...",
+    "library_context": "PRE-LOADED LIBRARY CONTEXT\n\nGlobal tags (top 50 from 1250 files):\nbeach, sunset, family, ...",
+    "tool_definitions": [{"type": "function", "function": {"name": "get_scoped_tags", ...}}, ...],
+    "tool_budget": 10,
+    "total_files": 1250,
     "date_range": {"min": "2023-01-15", "max": "2026-04-10"},
-    "file_count": 1250,
+    "top_tags": ["beach", "sunset", "family", "vacation", "dogs"],
     "conversation_count": 8
   }
 }
@@ -105,347 +188,306 @@ Receive:
 
 | Field | Description |
 |-------|-------------|
-| `top_tags` | Up to 200 most common file tags, sorted by frequency |
-| `total_tags` | Total unique tags across all files |
-| `conv_tags` | Keywords extracted from compacted conversation summaries |
-| `date_range` | `min`/`max` file creation dates in the library |
-| `file_count` | Total files in the library |
-| `conversation_count` | Compacted conversations available for search |
+| `system_prompt` | Full system prompt with library context already injected — use as-is as the system message for the Cloud AI LLM call |
+| `library_context` | The context block alone — useful if you want to customize the system prompt around it |
+| `tool_definitions` | OpenAI function-calling schemas for all registered MCP tools — pass directly as the `tools` parameter in every Cloud AI LLM call, no hardcoding needed |
+| `tool_budget` | Number of tool calls allowed before the AI must produce a final answer |
+| `total_files` | Total files in the library |
+| `date_range` | `min` and `max` file creation dates |
+| `top_tags` | Top 200 most common tags, sorted by frequency |
+| `conversation_count` | Number of compacted conversations with embeddings |
+
+**Use `data.system_prompt` directly.** It already contains the tool descriptions, budget rules, strategy, answer format, and the pre-loaded library context (global tags, date range, and relevant past conversations matched to the query). You do not need to build a system prompt yourself.
 
 ---
 
-### Step 3 — Extraction: Cloud AI Determines Search Parameters
+### Step 3 — Configure the LLM for Tool Calling
 
-Call your cloud AI using the system prompt below. Substitute in the library context from Step 2.
+Use `data.tool_definitions` from the `get_library_context` response directly as the `tools` parameter in every Cloud AI LLM call — no schema hardcoding needed. The server always returns complete, up-to-date OpenAI-format schemas for all registered MCP tools.
 
-**System Prompt:**
-```
-Extract search parameters from the user's question about their media library.
-
-LIBRARY TAGS ({top_tags count} shown, {total_tags} total): {top_tags comma-separated}
-CONVERSATION KEYWORDS ({conv_tags count} keywords from chat history): {conv_tags comma-separated}
-LIBRARY DATE RANGE: {date_range.min} to {date_range.max}
-
-RESPOND EXACTLY:
-FILTER_ORDER:date_first or tags_first
-START_DATE:YYYY-MM-DD or none
-END_DATE:YYYY-MM-DD or none
-TAGS:tag1,tag2,tag3 or none
-RAG_QUERY:semantic search phrase
-PLAN:one_step or two_step
-
-RULES:
-- FILTER_ORDER: date_first when the question mentions a specific date/time period.
-  tags_first when the question is about a topic with no specific date.
-- START_DATE / END_DATE: Use the same date for both if asking about a single day.
-  Use none if no date is mentioned.
-- TAGS: Pick from LIBRARY TAGS or CONVERSATION KEYWORDS. Choose 3-10 most relevant.
-- RAG_QUERY: A descriptive search phrase for semantic ranking.
-- PLAN: one_step for direct questions. two_step if the answer requires chaining
-  (e.g. first find when an event happened, then search around that date).
-- Use none for any field that does not apply.
-- Start your response with FILTER_ORDER: immediately.
+```python
+tools = library_context_response["data"]["tool_definitions"]
+# Pass to your Cloud AI LLM call:
+# openai_client.chat.completions.create(..., tools=tools, tool_choice="auto")
 ```
 
-**User message:** the user's question.
-
-**Parse the AI response** line by line to extract:
-
-```
-FILTER_ORDER → filter_order  (date_first | tags_first)
-START_DATE   → start_date    (YYYY-MM-DD or null)
-END_DATE     → end_date      (YYYY-MM-DD or null)
-TAGS         → tags          (list of strings, or empty)
-RAG_QUERY    → rag_query     (string)
-PLAN         → plan          (one_step | two_step)
-```
-
-Parsing rules:
-- Skip any line that does not contain `:`
-- Split on the first `:` only — values may themselves contain colons
-- If a value is the literal word `none`, treat it as null / empty
+The schemas describe the parameter contracts already enforced by the server (refer to [The Four MCP Tools](#the-four-mcp-tools) for human-readable descriptions). Key points:
+- `scoped_rag_search` requires `query`, `start_date`, `end_date`, and `min_tags`
+- All other tools have no required fields (all parameters optional)
+- All string dates must be in `YYYY-MM-DD` format
 
 ---
 
-### Step 4 — Scoped Search: Server Filters and Ranks
+### Step 4 — First LLM Call
 
-Send the extracted parameters to the server:
+Send to your Cloud AI:
+
+- **System message:** `data.system_prompt` from Step 2
+- **User message:** the user's question
+- **Tools:** `data.tool_definitions` from Step 2
+- **Tool choice:** `auto`
+
+The AI will either respond with tool calls or — if the pre-loaded library context is already sufficient — produce a final answer immediately.
+
+---
+
+### Step 5 — Tool-Calling Loop
+
+Repeat for each iteration until the AI produces a plain text response:
+
+#### 5a — Receive Tool Calls
+
+The Cloud AI LLM responds with one or more tool calls. Each call has:
+- A tool name (`get_scoped_tags`, `get_scoped_dates`, `scoped_rag_search`, or `get_conversation_rag`)
+- A set of arguments (matching the tool's parameter schema)
+
+#### 5b — Forward Each Tool Call to the Server
+
+For each tool call, send a message to the server:
 
 ```json
 {
-  "action": "scoped_search",
-  "rag_query": "{rag_query}",
-  "start_date": "{start_date or null}",
-  "end_date": "{end_date or null}",
-  "tags": ["{tag1}", "{tag2}"],
-  "k": 8
+  "action": "<tool_name>",
+  "budget_remaining": <current_budget_remaining>,
+  "<arg1>": <value1>,
+  "<arg2>": <value2>
 }
 ```
 
-The server may send one or more `status` messages before the result. Consume them (optionally display to the user) then wait for the `result` message:
+Include `budget_remaining` (your current count before this call). The server uses it to append the correct budget annotation to the result.
+
+Optionally include `embedding_model` to override which embedding model the server uses for `scoped_rag_search`.
+
+The server will first send a `status` message (`"Executing MCP tool: <name>..."`), then the `result` message.
+
+#### 5c — Process the Result
+
+The `result` message contains:
 
 ```json
 {
   "type": "result",
+  "message": "<tool output text>\n\n[Tool calls remaining: N]",
   "data": {
-    "candidates": [ ... ],
-    "file_count": 6,
-    "conv_count": 2
+    "tool": "<tool_name>",
+    "raw": "<tool output text without annotation>",
+    "budget_after": <N>
   }
 }
 ```
 
-Each candidate in the `candidates` array is either a **file** or a **conversation**:
+Use the `message` field (top-level in the WebSocket JSON) as the tool result string inserted into the LLM conversation for that tool call ID. It already includes the `[Tool calls remaining: N]` annotation that the system prompt tells the AI to watch.
 
-**File candidate:**
-```json
-{
-  "type": "file",
-  "fileName": "IMG_2847.jpg",
-  "creationTime": "2025-06-15T10:30:00Z",
-  "tags": ["beach", "family"],
-  "description": "Family at the beach",
-  "fileType": "image",
-  "formatted": "• IMG_2847.jpg\n  Date: 2025-06-15\n  Tags: beach, family\n  Desc: Family at the beach"
-}
-```
+Update your local budget counter: `budget_remaining = data.budget_after`.
 
-**Conversation candidate:**
-```json
-{
-  "type": "conversation",
-  "id": "conv_20250610",
-  "summary": "Discussed planning a beach trip...",
-  "tags": ["beach", "vacation"],
-  "compacted_at": "2025-06-20T14:00:00Z",
-  "formatted": "• [Conversation conv_20250610]\n  Compacted: 2025-06-20\n  Keywords: beach, vacation\n  Facts: Discussed planning a beach trip..."
-}
-```
+#### 5d — Next LLM Call
 
-The `formatted` field is a pre-built text block ready to be inserted directly into your synthesis prompt. Use it as-is.
+Add all tool results from this iteration to the conversation, then **apply history truncation** (see [Tool Call History Truncation](#tool-call-history-truncation) below) before calling the Cloud AI again.
 
-> **Note:** Conversation candidates are **never filtered by date**. `start_date`/`end_date` apply to files only. Conversations always participate in tag filtering and semantic ranking regardless of date range.
+**Budget enforcement on the client side:**
+- If `budget_after == 1`: On the next LLM call, send **only** `scoped_rag_search` as the available tool (omit the other three). This forces a final targeted search.
+- If `budget_after == 0`: On the next LLM call, send **no tools** at all (force a plain text response). The AI has already received the `[Tool calls remaining: 0 — generate your final answer now]` annotation in the last result.
+
+Repeat Steps 5a–5d until the LLM responds with no tool calls.
 
 ---
 
-### Step 5 — Synthesis: Cloud AI Generates the Answer
+### Step 6 — Extract the Final Answer
 
-Concatenate all `formatted` fields from the candidates to build the FILE DATA block, then call your cloud AI.
+The final Cloud AI response will be formatted as:
 
-**FILE DATA block format:**
 ```
-=== FILE DATA ===
-{candidate_1.formatted}
+<conclusion>
+Based on the search results, ...
+</conclusion>
 
-{candidate_2.formatted}
-
-...
-=== END ===
-```
-
-**System Prompt (when N short extractions remain):**
-```
-You are a helpful assistant. Answer the user's question using ONLY the data below.
-Context may include media files and past conversation summaries (labeled 'Conversation').
-
-RULES:
-- Start your answer immediately.
-- Reference specific file names, dates, tags, descriptions, or conversation facts.
-- If the data IS SUFFICIENT, answer directly and completely.
-- If the data is INSUFFICIENT to answer confidently, you may request a Short Extraction —
-  a targeted follow-up search with different parameters. You have {N} Short Extraction(s) remaining.
-  To request one, output EXACTLY this block first (before any explanation):
-
-SHORT_EXTRACTION
-START_DATE:YYYY-MM-DD or none
-END_DATE:YYYY-MM-DD or none
-TAGS:tag1,tag2,tag3 or none
-RAG_QUERY:focused phrase for the missing information
-INSIGHT:one sentence summarizing what you learned so far from this extraction
-
-  Then explain what specific information is still missing.
-  INSIGHT is important — it carries your findings forward to the next search round.
+<files>
+photo_2024_01_15.jpg
+video_birthday.mp4
+</files>
 ```
 
-**User message:**
-```
-{user_question}
-
-=== FILE DATA ===
-{formatted candidates joined by blank lines}
-=== END ===
-```
+- Extract the content inside `<conclusion>...</conclusion>` as the answer text
+- Extract filenames listed inside `<files>...</files>` (one per line) as the list of referenced files
+- If no structured tags are present, use the full response text as-is
 
 ---
 
-### Step 6 — Short Extraction Loop (if needed)
+### Step 7 — Close the Connection
 
-If the synthesis response contains `SHORT_EXTRACTION`, the AI needs more data. Repeat the following up to N times (recommended default: 2).
-
-#### 6a — Parse the Directive
-
-Read the SHORT_EXTRACTION block from the AI response:
-
-```
-SHORT_EXTRACTION  → signals a follow-up search is requested
-START_DATE:       → se_start_date  (YYYY-MM-DD or null)
-END_DATE:         → se_end_date    (YYYY-MM-DD or null)
-TAGS:             → se_tags        (list of strings or null)
-RAG_QUERY:        → se_rag_query   (string)
-INSIGHT:          → insight        (single sentence string)
-```
-
-Use the same line-by-line parsing rules from Step 3.
-
-#### 6b — Collect the Insight
-
-Append the insight to a running list of all insights so far:
-
-```
-insights_list ← append "Round {round_number}: {insight}"
-```
-
-All insights from all prior rounds accumulate and are passed forward together in Step 6e.
-
-#### 6c — Run Another Scoped Search
-
-Send the new parameters parsed from the directive:
-
-```json
-{
-  "action": "scoped_search",
-  "rag_query": "{se_rag_query}",
-  "start_date": "{se_start_date or null}",
-  "end_date": "{se_end_date or null}",
-  "tags": ["{se_tag1}", ...],
-  "k": 8
-}
-```
-
-Consume status messages and wait for the `result` message, same as Step 4.
-
-#### 6d — Merge Candidates
-
-Merge new candidates into the existing candidate list:
-- Deduplicate: skip any candidate whose `fileName` (file) or `id` (conversation) is already in the list
-- Cap the total list at 8 candidates
-
-#### 6e — Re-synthesize with Insights
-
-Compute remaining count: `remaining = N - round_number - 1`
-
-Build the INSIGHTS block from all collected insights across all rounds:
-
-```
-=== INSIGHTS FROM PREVIOUS ROUNDS ===
-Round 1: {insight from round 1}
-Round 2: {insight from round 2}
-=== END INSIGHTS ===
-```
-
-**System Prompt:** Same synthesis prompt as Step 5, with `{N}` replaced by `remaining`. If `remaining = 0`, use the final prompt below instead.
-
-**User message:**
-```
-{user_question}
-
-=== INSIGHTS FROM PREVIOUS ROUNDS ===
-Round 1: {insight}
-Round 2: {insight}
-=== END INSIGHTS ===
-
-=== FILE DATA ===
-{formatted merged candidates joined by blank lines}
-=== END ===
-```
-
-If the response again contains `SHORT_EXTRACTION` and `remaining > 0`, repeat from Step 6a.
-
-**System Prompt (when 0 short extractions remain — final synthesis):**
-```
-You are a helpful assistant. Answer the user's question using ONLY the data below.
-Context may include media files and past conversation summaries (labeled 'Conversation').
-
-RULES:
-- Start your answer immediately.
-- Reference specific file names, dates, tags, descriptions, or conversation facts.
-- This is the final answer. Do NOT request further searches. If the data is still
-  insufficient, state what you found and what is missing.
-```
+Close the WebSocket. Optionally re-use the same connection for follow-up questions in the same session without calling `get_library_context` again (the pre-loaded context is already set).
 
 ---
 
-### Step 7 — Clean Up and Return
+## Tool Call History Truncation
 
-Strip any remaining directive lines from the final response before returning it to the user.
+Each MCP tool result can be hundreds of lines long. Keeping the full text of every result in the conversation history will exhaust the context window after a few tool calls. You must **compact older tool results** before every LLM call.
 
-Remove any line whose content (trimmed, case-insensitive) starts with one of:
+### When to Apply
+
+After ALL tool calls for the current iteration have been appended to the conversation, and **before** sending the messages list to the Cloud AI for the next iteration — truncate every `role:tool` message **except the most recently added one**. The newest result stays in full so the model can reason about it; older results only need to show a summary and their budget annotation.
 
 ```
-SHORT_EXTRACTION
-START_DATE:
-END_DATE:
-TAGS:
-RAG_QUERY:
-INSIGHT:
+[system]          ← never touch
+[user]            ← never touch
+[assistant]       ← never touch (tool call request)
+[tool: result 1]  ← truncate  (older)
+[tool: result 2]  ← truncate  (older)
+[assistant]       ← never touch
+[tool: result 3]  ← truncate  (older)
+[tool: result 4]  ← KEEP FULL  ← most recently added
+
+  ↓ Cloud AI call happens here
+
+[assistant]       ← append new response
+[tool: result 5]  ← KEEP FULL  ← newest after next iteration
+[tool: result 4]  ← NOW truncate (was previously newest)
 ```
 
-Return the cleaned text as the final answer.
+### The Algorithm
+
+Implement two functions in your client — a **single-result shrinker** and a **message-list walker** that applies it. The server reference implementation is `_truncate_tool_result` and `_apply_history_truncation` in `app/services/deep_chat_handler.py`.
+
+**Single-result shrinker** (`truncate_tool_result(content, max_results)`):
+
+1. Scan the content for the budget annotation line matching `[Tool calls remaining: …]`. Extract it and set it aside — it must be re-appended at the end regardless of truncation.
+2. Split the content by newline.
+3. Treat the **first line** as the header summary (e.g., `"Top 5 results for 'beach'…"`). Always keep it.
+4. Collect the remaining non-empty lines that are **not** the budget annotation line into a body list.
+5. Keep only the first `max_results` entries from the body list. Count how many were omitted.
+6. Rebuild the result: header + kept body lines + (if any omitted) a note such as `"... (N more results omitted)"` + the budget annotation line.
+
+**Message-list walker** (`apply_history_truncation(messages, max_results)`):
+
+1. Walk the full messages list and find the **index of the last** `role:tool` message.
+2. Walk the list again. For every `role:tool` message whose index is **not** the last one, replace its `content` with the result of `truncate_tool_result(content, max_results)`.
+3. Leave all other roles (`system`, `user`, `assistant`) completely untouched.
+
+### Rules
+
+| Rule | Detail |
+|------|--------|
+| **Never truncate `role:assistant`** | The LLM's own reasoning and `<think>…</think>` blocks must stay intact — truncating them corrupts the reasoning chain |
+| **Never truncate `role:user` or `role:system`** | Only `role:tool` messages are touched |
+| **Always preserve the budget annotation** | The `[Tool calls remaining: N]` line at the end of every tool message is always kept, even after truncation — the LLM reads it to track budget |
+| **Newest tool result is always kept full** | Only results from previous iterations are truncated; the current iteration's results stay intact |
+| **Apply before every LLM call** | Not after: apply the truncation immediately before forwarding the message list to the Cloud AI |
+
+### Configuration
+
+The server config setting that controls the body line limit for the local deep-chat loop is `tool_history_max_results` (default: 5). Use the same value for your Cloud AI client, or adjust it to suit the context window of your Cloud AI model. Read or update it via `GET /api/config` and `POST /api/config` with the `tool_history_max_results` field.
+
+**Context-window guidance:**
+
+| Cloud AI model context | Recommended `max_results` |
+|------------------------|---------------------------|
+| 8K tokens | 3 |
+| 32K tokens | 5–7 (server default) |
+| 128K+ tokens | 10–20 |
 
 ---
 
-## Important Notes
+## Budget and Tool Availability
 
-### Conversations Are Never Date-Filtered
+The budget is managed jointly by the client and the server:
 
-Compacted conversation summaries always participate in search regardless of the `start_date`/`end_date` sent. Only file candidates are date-filtered. This ensures past conversational memory is always available.
+| Remaining calls | Server behaviour | Client behaviour |
+|-----------------|-----------------|-----------------|
+| > 1 | Appends `[Tool calls remaining: N]` to result | Send all 4 tools in next LLM call |
+| = 1 | Appends `[Tool calls remaining: 1]` to result | Send **only** `scoped_rag_search` in next LLM call |
+| = 0 | Appends `[Tool calls remaining: 0 — generate your final answer now]` to result | Send **no tools** in next LLM call |
 
-### Insight Accumulation Is Lightweight Context
+The system prompt already instructs the AI about these rules — the client only needs to enforce the tool list restriction on the LLM side.
 
-Do **not** pass the full previous AI response into re-synthesis rounds — it pollutes the context window. Pass only the `INSIGHT` sentence extracted from each round's directive. The AI uses it to remember what it already found without re-reading all prior output.
+---
 
-### Deduplication Cap
+## Strategy the AI Follows
 
-Always deduplicate and cap the candidate list at 8 when merging Short Extraction results. Sending more than ~8 candidates to the synthesis prompt starts to degrade reasoning quality.
+The system prompt instructs the AI to use this search strategy:
 
-### Two-Step Plan Handling
+1. **Consult pre-loaded context first.** The `get_library_context` response already includes global tags, date range, and the most relevant past conversation summaries. If this is sufficient to scope a `scoped_rag_search`, the AI should skip `get_scoped_tags` and `get_scoped_dates` and call `scoped_rag_search` directly.
 
-If the extraction AI outputs `PLAN:two_step`, the question requires chaining — for example: "Find photos from the same trip as my birthday party." This means:
-1. **First search** finds the birthday party date
-2. **Short Extraction** uses that discovered date to find related trip photos
+2. **Explore the scope only when needed.** Use `get_scoped_tags` or `get_scoped_dates` only when the question requires a narrower or more specific scope than what was pre-loaded.
 
-No special handling is required. The AI will naturally use Short Extraction to chain searches when it recognises a two-step need.
+3. **`scoped_rag_search` always requires a concrete scope.** The AI must have a specific date range AND at least one tag before calling it. The pre-loaded context or an exploration tool call provides these.
+
+4. **Use `get_conversation_rag` for conversation-based facts** not already covered by the pre-loaded conversation context.
+
+5. **Quality evaluation at each step.** The system prompt requires the AI to assess in its reasoning: "Is this result sufficient? What is still missing? What should I search next given remaining budget?"
+
+6. **Answer format is enforced.** The AI must wrap its final answer in `<conclusion>...</conclusion>` and list referenced files in `<files>...</files>`.
 
 ---
 
 ## Message Flow Diagram
 
 ```
-CLIENT                                        SERVER
-  │                                              │
+CLIENT                                          SERVER
+  │                                                │
   │── CONNECT ───────────────────────────────────►│
-  │◄─ {"type":"status","message":"...ready."}    │
-  │                                              │
-  │── {"action":"get_library_context"} ──────────►│
-  │◄─ {"type":"result","data":{tags, dates, ...}}│
-  │                                              │
-  │  [Cloud AI: Extraction call]                  │
-  │                                              │
-  │── {"action":"scoped_search", ...params} ─────►│
-  │◄─ {"type":"status",...}  (one or more)       │
-  │◄─ {"type":"result","data":{"candidates":[…]}}│
-  │                                              │
-  │  [Cloud AI: Synthesis call]                   │
-  │                                              │
-  │  ── if SHORT_EXTRACTION ──────────────────    │
-  │── {"action":"scoped_search", ...new params} ─►│  (repeat up to N times)
-  │◄─ {"type":"status",...}                      │
-  │◄─ {"type":"result","data":{"candidates":[…]}}│
-  │  [Cloud AI: Re-synthesis with insights]       │
-  │  ─────────────────────────────────────────── │
-  │                                              │
+  │◄─ {"type":"status","message":"...ready."}      │
+  │                                                │
+  │── {"action":"get_library_context",             │
+  │    "query":"<user question>"} ───────────────►│
+  │◄─ {"type":"result","data":{                    │
+  │       "system_prompt":"...",                   │
+  │       "tool_budget":10, ...}} ─────────────── │
+  │                                                │
+  │  [Cloud AI call: system_prompt + user msg]     │
+  │  → AI responds with tool calls                 │
+  │                                                │
+  │── {"action":"get_scoped_dates",                │
+  │    "min_tags":["beach"],                       │
+  │    "budget_remaining":10} ───────────────────►│
+  │◄─ {"type":"status",...}                        │
+  │◄─ {"type":"result","message":"...\n\n          │
+  │    [Tool calls remaining: 9]",                 │
+  │    "data":{"budget_after":9,...}} ─────────── │
+  │                                                │
+  │  [Feed result into LLM conversation]           │
+  │  [Cloud AI call: AI responds with tool call]   │
+  │                                                │
+  │── {"action":"scoped_rag_search",               │
+  │    "query":"beach vacation with family",       │
+  │    "start_date":"2025-06-01",                  │
+  │    "end_date":"2025-06-30",                    │
+  │    "min_tags":["beach","family"],              │
+  │    "budget_remaining":9} ────────────────────►│
+  │◄─ {"type":"status",...}                        │
+  │◄─ {"type":"result","message":"Top 5 results    │
+  │    ...\n\n[Tool calls remaining: 8]",          │
+  │    "data":{"budget_after":8,...}} ─────────── │
+  │                                                │
+  │  [Feed result into LLM conversation]           │
+  │  [Cloud AI call: AI produces final answer]     │
+  │  → Response contains no tool calls             │
+  │                                                │
   │── CLOSE ─────────────────────────────────────►│
 ```
+
+---
+
+## Important Notes
+
+### `scoped_rag_search` Requires Mandatory Scoping
+
+Unlike the exploration tools, `scoped_rag_search` **always** requires `start_date`, `end_date`, and at least one entry in `min_tags`. The AI cannot call it with open-ended parameters. This is by design: the pre-loaded library context or one exploration call (at most) should always provide sufficient scoping data before the semantic search.
+
+### Conversations Are Never Date-Filtered
+
+Compacted conversation summaries always participate in `scoped_rag_search` regardless of the `start_date`/`end_date` sent. Only file candidates are date-filtered. This ensures past conversational memory is always available.
+
+### Pre-Loaded Context Reduces Tool Calls
+
+The server pre-fetches global tags, the overall date range, and relevant past conversations matched to the user's question, and injects them all into the system prompt. For many questions this eliminates the need for `get_scoped_tags` and `get_scoped_dates` entirely — the AI can go directly to `scoped_rag_search` on its first tool call.
+
+### Tool Results Are Ready for LLM Injection
+
+Use the `message` field of each tool result directly as the tool result in the Cloud AI LLM conversation. It already contains the formatted output plus the `[Tool calls remaining: N]` annotation. Use `data.raw` only if you need the unannotated text for other purposes.
+
+### `budget_remaining` Is Optional but Strongly Recommended
+
+If you omit `budget_remaining` from tool calls, the server will not append a budget annotation and the AI will not see how many calls remain. The system prompt's budget rules will still be stated at session start (from the static `tool_call_budget` value), but the AI won't receive per-call updates. Always pass `budget_remaining` for correct budget-aware behaviour.
 
 ---
 
@@ -458,6 +500,7 @@ CLIENT                                        SERVER
 | `WS /api/compact-conversations` | Summarize + embed conversations locally |
 | `WS /api/cloud-compact` | Embed client-provided summaries (cloud workflow) |
 | `WS /api/deep-chat` | Local Deep Chat (server runs all LLM calls) |
-| `WS /api/scoped-rag-search` | Cloud Deep Chat (server does filtering + ranking only) |
+| `WS /api/mcp` | Cloud Deep Chat — MCP tool endpoint (server does filtering + ranking; cloud AI drives the loop) |
 
-See [API_REFERENCE.md](../API_REFERENCE.md) for full endpoint documentation.
+See [API_REFERENCE.md](../API_REFERENCE.md) for full endpoint and message format documentation.
+

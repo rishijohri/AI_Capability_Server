@@ -21,6 +21,7 @@ class LLMParams(BaseModel):
     batch_size: int = Field(default=1024, description="Batch size")
     ubatch_size: int = Field(default=512, description="Micro-batch size")
     n_gpu_layers: int = Field(default=999, description="Number of GPU layers to offload")
+    enable_thinking: bool = Field(default=True, description="Enable thinking mode for llama-server (--chat-template-kwargs enable_thinking:true). Only applied when deep chat loads the model.")
 
 model_options = {
         "qwen_2.5_vl": { 
@@ -121,12 +122,35 @@ class ServerConfig(BaseModel):
         description="Reduced embedding size for RAG (None means original)"
     )
     chat_rounds: int = Field(
-        default=3, 
-        ge=1, 
-        le=10,
-        description="Number of rounds for user chat query"
+        default=10,
+        ge=1,
+        le=50,
+        description="Total number of MCP tool calls allowed per deep chat session. The agent uses these calls to explore the library (get_scoped_tags, get_scoped_dates) and fetch results (scoped_rag_search, get_conversation_rag). When 1 call remains only scoped_rag_search is offered; at 0 the agent must answer with what it has."
     )
-
+    tool_history_max_tags: int = Field(
+        default=7,
+        ge=1,
+        le=50,
+        description="Number of tags kept when truncating scoped_rag_search results in tool call history"
+    )
+    tool_history_max_results: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Number of results kept when truncating other MCP tool results in tool call history"
+    )
+    max_tags_per_scope: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        description="Maximum unique tags returned by get_scoped_tags per call"
+    )
+    max_dates_per_scope: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description="Maximum date ranges returned by get_scoped_dates per call"
+    )
     image_quality: float = Field(
         default=1.0,
         ge=0.0,
@@ -291,12 +315,8 @@ Remember: Both sections are required.""",
         description="Prompt template for generating descriptions"
     )
     deep_chat_system_prompt: str = Field(
-        default="""You are Persona, a thorough AI assistant that searches a user's media library and knowledge base to provide accurate, comprehensive answers.
-
-You have access to tools for searching media files (by semantic query, person, location, tags, dates), getting file details, listing known people/locations, getting library statistics, and searching conversation knowledge.
-
-Use tools proactively to gather relevant information before answering. Be thorough — call multiple tools from different angles if needed.""",
-        description="Base system prompt for deep chat mode (tool-calling agentic chat)"
+        default="",
+        description="Override system prompt for deep chat mode. Empty string uses the built-in default from deep_chat_prompts.py."
     )
     deep_chat_worker_model: str = Field(
         default="",
@@ -308,14 +328,6 @@ Use tools proactively to gather relevant information before answering. Be thorou
         le=4,
         description="Number of parallel workers for deep chat (1-4). Workers share the same llama-server process."
     )
-    deep_chat_max_short_extractions: int = Field(
-        default=2,
-        ge=0,
-        le=5,
-        description="Maximum number of Short Extraction cycles Deep Chat can perform when it needs additional context (0-5). Each cycle runs a targeted scoped-RAG search with AI-chosen parameters."
-    )
-
-    
     # LLM Parameters
     llm_params: LLMParams = Field(default_factory=LLMParams)
     

@@ -83,7 +83,7 @@ The `fileName` field in `storage_metadata.json` should contain only the filename
 | `/api/cloud-chat` | WebSocket | Get RAG context for external cloud LLM |
 | `/api/compact-conversations` | WebSocket | Compact (summarize) conversations for RAG memory |
 | `/api/cloud-compact` | WebSocket | Embed client-provided conversation summaries for RAG (cloud AI workflow) |
-| `/api/scoped-rag-search` | WebSocket | Scoped RAG search for Cloud AI Deep Chat (multi-message, persistent connection) |
+| `/api/mcp` | WebSocket | Cloud AI Deep Chat — MCP tool calling endpoint (multi-message, persistent connection) |
 
 ---
 
@@ -128,13 +128,18 @@ curl http://localhost:8000/api/config
     "mirostat": 0,
     "batch_size": 1024,
     "ubatch_size": 512,
-    "n_gpu_layers": 999
+    "n_gpu_layers": 999,
+    "enable_thinking": true
   },
   "rag_directory_name": "rag",
   "storage_metadata_path": null,
   "enable_conversation_compaction": true,
   "max_compaction_tokens": 2000,
-  "min_compaction_relevance": 0.4
+  "min_compaction_relevance": 0.4,
+  "tool_history_max_tags": 7,
+  "tool_history_max_results": 5,
+  "max_tags_per_scope": 100,
+  "max_dates_per_scope": 10
 }
 ```
 
@@ -143,7 +148,7 @@ curl http://localhost:8000/api/config
 | Field | Type | Editable | Description |
 |-------|------|----------|-------------|
 | `reduced_embedding_size` | int/null | ✅ | Target dimension for PCA reduction (null = no reduction) |
-| `chat_rounds` | int | ✅ | Number of conversation rounds to maintain (1-10) |
+| `chat_rounds` | int | ✅ | Total MCP tool calls allowed per deep chat session (the tool budget). When 1 call remains, only `scoped_rag_search` is offered. At 0 calls the agent must produce a final answer. Default: 10 |
 | `image_quality` | float | ✅ | Image scale multiplier (0.0-1.0): 1.0 = original dimensions, <1.0 = scale down (e.g., 0.5 = half size) |
 | `llm_mode` | string | ✅ | LLM backend: `server` (persistent) or `cli` (per-request) |
 | `top_k` | int | ✅ | Number of RAG results to retrieve (1-50) |
@@ -160,10 +165,14 @@ curl http://localhost:8000/api/config
 | `backend` | string | ✅ | Same as `llm_mode` |
 | `model_timeout` | int | ✅ | Seconds before unloading inactive model |
 | `llm_timeout` | int | ✅ | Timeout for LLM operations in seconds (10-3600) |
-| `llm_params` | object | ✅ | LLM execution parameters |
+| `llm_params` | object | ✅ | LLM execution parameters: `ctx_size`, `temp`, `top_p`, `top_k`, `presence_penalty`, `mirostat`, `batch_size`, `ubatch_size`, `n_gpu_layers`, `enable_thinking` (bool, default `true` — enables thinking mode when deep chat loads the model) |
 | `enable_conversation_compaction` | bool | ✅ | Enable conversation compaction (dreaming mechanism) for summarizing conversations into RAG |
 | `max_compaction_tokens` | int | ✅ | Token budget for compacted conversation context injected into chat (100-8000) |
 | `min_compaction_relevance` | float | ✅ | Minimum similarity score for compacted conversation retrieval (0.0-1.0) |
+| `tool_history_max_tags` | int | ✅ | Number of tags retained when truncating `get_scoped_tags` results in tool call history (default: 7) |
+| `tool_history_max_results` | int | ✅ | Number of results retained when truncating other MCP tool results in tool call history (default: 5) |
+| `max_tags_per_scope` | int | ✅ | Maximum tags returned by `get_scoped_tags` per call (default: 100) |
+| `max_dates_per_scope` | int | ✅ | Maximum date ranges returned by `get_scoped_dates` per call (default: 10) |
 | `rag_directory_name` | string | ❌ | RAG directory name (read-only) |
 | `storage_metadata_path` | string/null | ❌ | Current metadata path (read-only) |
 
@@ -1994,263 +2003,188 @@ Invalid history role:
 
 ### WS /api/deep-chat
 
-Interactive chat with multi-round thinking and RAG function access. The LLM can perform multiple rounds of internal reasoning and has access to functions that allow querying the media RAG (which includes both file embeddings and compacted conversation memories). For the client, this endpoint acts the same as `/api/chat`.
+Agentic deep chat with an OpenAI-compatible tool-calling loop. The local LLM autonomously calls 4 MCP tools to explore and retrieve from the media library before producing a final answer. The server pre-loads a global library context (tags, date range, relevant past conversations) into the system prompt so the agent can often skip early exploration calls.
 
-**Important:** Each WebSocket connection handles a **single request-response cycle**. The connection automatically closes after the response is complete. For follow-up questions, initiate a new WebSocket connection and provide the conversation history via the `history` parameter.
+**Requires `llm_mode: server`** — tool calling is only supported with llama-server.
+
+**Important:** Each WebSocket connection handles a **single request-response cycle**. The connection closes after the answer is sent. For follow-up questions, open a new connection and provide `history`.
 
 **Connection:** `ws://localhost:8000/api/deep-chat`
 
 **Key Features:**
-- **Initial context gathering**: Automatic limited RAG search (top 3 results) before Round 1
-- **Multi-round thinking**: The LLM performs `chat_rounds` iterations of internal reasoning (configurable via `/api/config`)
-- **Enhanced system prompt**: Uses a specialized "Deep Thinking mode" prompt that strongly encourages function usage
-- **RAG function calling**: In each round, the LLM can call functions to:
-  - `query_media_rag(query, k)`: Search the unified RAG index (media files + compacted conversation memories) with custom queries
-- **Transparent to client**: The client sees only the final response, not intermediate thinking rounds
-- **Same interface as /api/chat**: Request and response format is identical to `/api/chat`
+- **Pre-loaded library context**: Global tags, overall date range, and relevant past conversations are injected into the system prompt before the first tool call — the agent can go directly to `scoped_rag_search` when the global context is sufficient
+- **4 MCP tools**: `get_scoped_tags`, `get_scoped_dates`, `scoped_rag_search`, `get_conversation_rag`
+- **Budget enforcement**: `chat_rounds` config = total tool calls allowed. At budget=1 only `scoped_rag_search` is offered; at budget=0 the model is forced to answer immediately
+- **Tool call history truncation**: After each tool result is consumed it is compacted to save context window space (controlled by `tool_history_max_tags` and `tool_history_max_results` config)
+- **Transparent intermediate messages**: Client receives `thinking`, `progress`, `conclusion`, and `files` messages
 
 **How This Differs from Regular Chat:**
 
 | Aspect | `/api/chat` | `/api/deep-chat` |
 |--------|-------------|------------------|
-| Initial RAG | Full automatic search | Limited automatic search (baseline) |
-| Additional RAG | None | LLM-controlled function calls |
-| RAG Scope | Unified index (files + conversations) | Same unified index, with targeted queries |
-| System Prompt | Standard chat prompt | Deep thinking prompt (encourages function use) |
-| LLM Control | No control over RAG | Full control via function calls |
+| Initial context | Automatic RAG search | Pre-loaded library context (tags, dates, conversations) |
+| LLM tool access | None | 4 MCP tools (`get_scoped_tags`, `get_scoped_dates`, `scoped_rag_search`, `get_conversation_rag`) |
+| Budget | N/A | `chat_rounds` tool calls (default 10) |
+| System prompt | Standard chat prompt | Deep chat prompt with tool definitions, budget rules, and pre-loaded context |
+| Requires llm_mode | `server` or `cli` | `server` only |
+| Final answer format | Plain text | `<conclusion>...</conclusion>` and `<files>...</files>` tags |
+
+---
 
 **1. Client Connects**
 
-**2. Server Loads Models:**
+**2. Server Ready Message:**
 ```json
-{
-  "type": "status",
-  "message": "Loading RAG database..."
-}
-```
-
-```json
-{
-  "type": "status",
-  "message": "Loading embedding model embeddinggemma-300M-Q8_0.gguf..."
-}
-```
-
-```json
-{
-  "type": "status",
-  "message": "Loading chat model Qwen3-8B-Q4_K_M.gguf..."
-}
-```
-
-```json
-{
-  "type": "status",
-  "message": "Deep Chat ready. Send your message."
-}
+{"type": "status", "message": "Deep Chat ready. Send your message."}
 ```
 
 **3. Client Sends Message:**
-
-The request format is identical to `/api/chat`:
-
 ```json
 {
   "message": "What beach photos do I have and when were they taken?",
-  "history": []
+  "history": [],
+  "image_name": null
 }
 ```
-
-**Message Parameters:**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `message` | string | ✅ | The current user message to process |
-| `history` | array | ❌ | Optional chat history in OpenAI format |
-| `image_name` | string | ❌ | Optional image filename for visual conversations |
+| `message` | string | ✅ | The user's question |
+| `history` | array | ❌ | Previous conversation turns (OpenAI format). Omit or send `[]` for a new conversation |
+| `image_name` | string | ❌ | Optional filename for a visual conversation — the image's tags and description are injected into the user message |
 
-**4. Server Gathers Initial Context:**
+**4. Server Loads Model and Gathers Context:**
+```json
+{"type": "status", "message": "Loading chat model Qwen3-8B-Q4_K_M.gguf..."}
+```
+```json
+{"type": "status", "message": "Deep Chat: Starting tool-calling loop..."}
+```
+```json
+{"type": "status", "message": "Gathering library context..."}
+```
 
-Before thinking rounds begin, the server automatically performs a limited RAG search:
+**5. Tool-Calling Loop:**
+
+The server iterates until the LLM produces a response with no tool calls (or the budget runs out):
 
 ```json
 {
   "type": "status",
-  "message": "Gathering initial context..."
+  "message": "[Iteration 1] Thinking... (10 tool call(s) remaining)",
+  "data": {"iteration": 1, "budget_remaining": 10, "tools_called": 0}
 }
 ```
+
+When the LLM calls a tool, the server sends two messages — an invocation status and a result:
 
 ```json
 {
   "type": "status",
-  "message": "Initial context gathered from 2 source(s)"
-}
-```
-
-**Initial Context Includes:**
-- Top 3 results from the unified RAG index (may include both media files and compacted conversation memories)
-
-This gives the LLM baseline information before Round 1.
-
-**5. Server Performs Multi-Round Thinking:**
-
-The server sends status updates for each thinking round:
-
-```json
-{
-  "type": "status",
-  "message": "Starting deep thinking (3 rounds)..."
-}
-```
-
-```json
-{
-  "type": "status",
-  "message": "Thinking round 1/3..."
-}
-```
-
-During each round, the LLM can:
-1. Review initial context (Round 1 only) and previous round results
-2. Analyze the user's question with available information
-3. Call `query_media_rag(query, k)` with custom search queries — this searches the unified RAG index containing both media files and compacted conversation memories
-4. Synthesize information from all sources
-5. Decide to continue thinking or provide final answer
-
-The LLM uses a **Deep Thinking mode system prompt** that encourages:
-- Using functions to gather comprehensive information
-- Making multiple targeted queries
-- Step-by-step reasoning
-- Only answering when fully informed
-
-```json
-{
-  "type": "status",
-  "message": "Thinking round 2/3..."
-}
-```
-
-```json
-{
-  "type": "status",
-  "message": "Thinking round 3/3..."
-}
-```
-
-**6. Server Streams Final Response:**
-
-Once the LLM determines it has gathered enough information, it provides the final answer:
-
-```json
-{
-  "type": "status",
-  "message": "Generating response..."
-}
-```
-
-Progress messages stream the final response:
-
-```json
-{
-  "type": "progress",
-  "message": "You have",
-  "data": {
-    "partial_response": "You have"
-  }
+  "message": "[Tool call 1] scoped_rag_search\n{\n  \"query\": \"beach photos\",\n  \"start_date\": \"2024-01-01\",\n  \"end_date\": \"2025-12-31\",\n  \"min_tags\": [\"beach\"]\n}",
+  "data": {"tool_name": "scoped_rag_search", "arguments": {"query": "beach photos", "start_date": "2024-01-01", "end_date": "2025-12-31", "min_tags": ["beach"]}, "tool_call_index": 1, "tool_call_number": 1, "budget_remaining": 9}
 }
 ```
 
 ```json
 {
   "type": "progress",
-  "message": " 12 beach photos",
-  "data": {
-    "partial_response": "You have 12 beach photos"
-  }
+  "message": "Top 5 results for 'beach photos'...\n\n• IMG_2847.jpg\n  Date: 2025-06-15\n  Tags: beach, family, summer",
+  "data": {"tool_name": "scoped_rag_search", "tool_call_number": 1, "result_length": 312, "budget_after": 9}
 }
 ```
 
-**6. Server Returns Result:**
+> **Note:** The budget annotation (`[Tool calls remaining: N]`) is appended to the tool result only inside the LLM conversation history — it is **not** included in the `message` field of the WebSocket `progress` message sent to the client.
 
+If the LLM emits reasoning content before a tool call, it is sent as a `thinking` message:
 ```json
 {
-  "type": "result",
-  "message": "Response complete",
-  "data": {
-    "response": "You have 12 beach photos in your collection, taken between June and August 2024...",
-    "thinking_rounds": 2,
-    "relevant_files": []
-  }
+  "type": "thinking",
+  "message": "<think>The pre-loaded context shows beach tags in 2024-2025...</think>",
+  "data": {"iteration": 1, "budget_remaining": 10, "pending_tool_calls": 1}
 }
 ```
 
-**Result Data:**
+**6. Final Answer:**
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `response` | string | The final generated response |
-| `thinking_rounds` | int | Number of thinking rounds actually used (may be less than `chat_rounds` if LLM finished early) |
-| `relevant_files` | array | List of relevant filenames (currently empty, may be populated in future versions) |
+When the LLM stops calling tools, the conclusion is streamed as `progress` chunks, then sent in full as a `conclusion` message:
+
+```json
+{"type": "progress", "message": "You have 12 beach photos"}
+```
+```json
+{"type": "progress", "message": " taken between June and August 2025..."}
+```
+```json
+{"type": "conclusion", "message": "You have 12 beach photos taken between June and August 2025. The most recent is IMG_2847.jpg from June 15, a family outing at a sandy beach."}
+```
+
+Referenced files:
+```json
+{"type": "files", "message": "IMG_2847.jpg, IMG_2901.jpg", "data": {"files": ["IMG_2847.jpg", "IMG_2901.jpg"]}}
+```
+
+Session summary:
+```json
+{"type": "full_response", "message": "You have 12 beach photos...", "data": {"tools_called": 1, "files": ["IMG_2847.jpg", "IMG_2901.jpg"]}}
+```
 
 **7. Connection Closes Automatically**
 
-**How It Works Internally:**
+---
 
-1. **Initial Gathering**: Server automatically searches RAG (limited results for baseline context)
+**Message Type Summary:**
 
-2. **Round 1**: LLM receives the question + initial context, then decides:
-   - Call `query_media_rag("beach photos summer 2024", k=10)` for comprehensive results (files + conversation memories)
-   
-3. **Round 2**: LLM receives function results and can:
-   - Analyze the retrieved information
-   - Make additional targeted function calls if needed (e.g., specific date ranges)
-   - Provide final answer if sufficient information is available
+| Type | When sent | Notable `data` fields |
+|------|-----------|----------------------|
+| `status` | Ready, model loading, context gathering, each iteration start, each tool invocation | `iteration`, `budget_remaining`, `tools_called`, `tool_name`, `arguments` |
+| `thinking` | LLM reasoning content emitted before tool calls | `iteration`, `budget_remaining`, `pending_tool_calls` |
+| `progress` | Tool result (during loop) and final answer chunks (streaming) | `tool_name`, `tool_call_number`, `budget_after` |
+| `conclusion` | Complete final answer text | — |
+| `files` | Referenced file names | `files` (array of strings) |
+| `full_response` | Session summary sent just before connection closes | `tools_called`, `files` |
+| `error` | Any error | — |
 
-4. **Round 3** (if needed): LLM synthesizes all information and provides final answer
+---
 
-The LLM automatically stops thinking when it's ready to answer, so it may use fewer rounds than the configured `chat_rounds`.
+**Available MCP Tools:**
+
+| Tool | Required args | Optional args | Description |
+|------|--------------|---------------|-------------|
+| `get_scoped_tags` | — | `start_date`, `end_date`, `min_tags` | List tags present in media files within an optional date/tag scope |
+| `get_scoped_dates` | — | `start_date`, `end_date`, `min_tags` | List date ranges within an optional scope |
+| `scoped_rag_search` | `query`, `start_date`, `end_date`, `min_tags` | — | Semantic search within a date/tag scope. Always available, even at budget=1 |
+| `get_conversation_rag` | `query` | — | Semantic search over compacted conversation memories |
+
+---
 
 **Configuration:**
 
-The number of thinking rounds is controlled by the `chat_rounds` parameter in the config:
-
+The tool budget is controlled by the `chat_rounds` setting (default: 10, range: 1–50):
 ```bash
 curl -X POST http://localhost:8000/api/config \
   -H "Content-Type: application/json" \
-  -d '{"chat_rounds": 5}'
+  -d '{"chat_rounds": 10}'
 ```
 
-**Benefits over /api/chat:**
-
-1. **Initial context + on-demand queries**: Gets baseline info automatically, then LLM can dive deeper
-2. **Better information gathering**: Can query the unified RAG index (files + conversation memories) with custom search terms
-3. **Multi-step reasoning**: Can analyze results and make follow-up queries
-4. **More comprehensive answers**: Synthesizes information from multiple targeted sources
-5. **LLM-controlled search**: The AI decides what to search for and when
-6. **Specialized prompting**: Deep thinking mode encourages thorough investigation
-7. **Configurable depth**: Adjust `chat_rounds` based on query complexity
+See also: `tool_history_max_tags`, `tool_history_max_results`, `max_tags_per_scope`, `max_dates_per_scope` in the configuration reference.
 
 **When to Use:**
 
-- **Use `/api/deep-chat`** for complex questions requiring multi-step reasoning or multiple information sources
-- **Use `/api/chat`** for simple questions where single-pass RAG search is sufficient
+- **Use `/api/deep-chat`** for complex, exploratory questions that benefit from multi-step library investigation (e.g., "What did we do at the beach last summer?")
+- **Use `/api/chat`** for simple questions where a single-pass automatic RAG search is sufficient
+- **Use `/api/mcp`** when you want to drive the same 4-tool loop yourself from a Cloud AI (GPT-4, Claude, etc.)
 
 **Error Cases:**
 
-Same error handling as `/api/chat`:
-
 ```json
-{
-  "type": "error",
-  "message": "No message provided"
-}
+{"type": "error", "message": "Deep Chat requires server mode (llm_mode: server). Tool calling needs llama-server."}
 ```
-
 ```json
-{
-  "type": "error",
-  "message": "Deep chat error: <error details>"
-}
+{"type": "error", "message": "No message provided"}
+```
+```json
+{"type": "error", "message": "Deep chat error: <error details>"}
 ```
 
 ---
@@ -3209,23 +3143,30 @@ General error:
 
 ---
 
-### WS /api/scoped-rag-search
+### WS /api/mcp
 
-Scoped RAG Search endpoint for Cloud AI Deep Chat. Unlike other WebSocket endpoints, this is a **persistent, multi-message connection** — the client can send multiple requests without reconnecting, enabling iterative search (Short Extraction rounds).
+**Cloud AI Deep Chat** — MCP tool endpoint. Exposes the same four MCP tools that drive the local `/deep-chat` agentic loop, so a Cloud AI (GPT-4, Claude, Gemini, etc.) can run its own multi-turn tool-calling session with identical retrieval capabilities.
 
-**Connection:** `ws://localhost:8000/api/scoped-rag-search`
+Unlike other WebSocket endpoints, this is a **persistent, multi-message connection** — the client can send multiple requests without reconnecting, enabling a full multi-iteration tool-calling loop.
+
+**Connection:** `ws://localhost:8000/api/mcp`
 
 **Prerequisites:**
 - Storage metadata must be set (`/api/set-storage-metadata`)
 - RAG must be generated (`/api/generate-rag`)
 - Conversations should be compacted for best results (`/api/compact-conversations` or `/api/cloud-compact`)
 
-**Two Actions Available:**
+**Five Actions Available:**
 
-| Action | Purpose |
-|--------|---------|
-| `get_library_context` | Get library tags, conversation keywords, date range, and counts |
-| `scoped_search` | Run date filter → tag filter → FAISS semantic ranking |
+| Action | Equivalent MCP Tool | Purpose |
+|--------|---------------------|---------|
+| `get_library_context` | _(pre-load helper)_ | Get the full library overview string + structured metadata that local deep-chat injects into its system prompt |
+| `get_scoped_tags` | `get_scoped_tags` | List top tags from a date/tag-scoped subset of the library |
+| `get_scoped_dates` | `get_scoped_dates` | List contiguous date ranges matching a scope |
+| `scoped_rag_search` | `scoped_rag_search` | Semantic search within a date/tag-scoped subset |
+| `get_conversation_rag` | `get_conversation_rag` | Semantic search across compacted conversation summaries |
+
+---
 
 **1. Client Connects**
 
@@ -3233,20 +3174,27 @@ Scoped RAG Search endpoint for Cloud AI Deep Chat. Unlike other WebSocket endpoi
 ```json
 {
   "type": "status",
-  "message": "Scoped RAG Search ready."
+  "message": "Cloud Deep Chat MCP tools ready."
 }
 ```
 
-**3a. Action: `get_library_context`**
+---
 
-Returns the library metadata the cloud AI needs to build its own extraction prompt.
+**Action: `get_library_context`**
+
+Returns the pre-loaded library context string (identical to what the local agent receives in its system prompt) plus structured metadata for programmatic use by the Cloud AI.
 
 **Request:**
 ```json
 {
-  "action": "get_library_context"
+  "action": "get_library_context",
+  "query": "beach vacation photos"
 }
 ```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `query` | string | ❌ | User question — used to find relevant past conversations to include in context |
 
 **Response:**
 ```json
@@ -3254,154 +3202,221 @@ Returns the library metadata the cloud AI needs to build its own extraction prom
   "type": "result",
   "message": "Library context retrieved",
   "data": {
-    "top_tags": ["beach", "sunset", "family", "vacation", "dogs"],
-    "total_tags": 342,
-    "conv_tags": ["trip planning", "photo editing", "birthday party"],
+    "system_prompt": "You are a research assistant...\n\nPRE-LOADED LIBRARY CONTEXT...",
+    "library_context": "PRE-LOADED LIBRARY CONTEXT\n\nGlobal tags (top 50 from 1250 files):\nbeach, sunset, family, ...\n\nLibrary date range: 2023-01-15 → 2026-04-10\n\nRelevant past conversations:\n...",
+    "tool_definitions": [{"type": "function", "function": {"name": "get_scoped_tags", ...}}, ...],
+    "tool_budget": 10,
+    "total_files": 1250,
     "date_range": {"min": "2023-01-15", "max": "2026-04-10"},
-    "file_count": 1250,
+    "top_tags": ["beach", "sunset", "family", "vacation", "dogs"],
     "conversation_count": 8
   }
 }
 ```
 
-**Response Data Fields:**
-
 | Field | Type | Description |
 |-------|------|-------------|
-| `top_tags` | array | Top 200 most common file tags, sorted by frequency |
-| `total_tags` | int | Total number of unique tags across all files |
-| `conv_tags` | array | Keywords extracted from compacted conversation summaries |
-| `date_range` | object | `min` and `max` creation dates across all files |
-| `file_count` | int | Total number of files in the library |
+| `system_prompt` | string | Full system prompt with library context already injected — ready to use directly in Cloud AI calls |
+| `library_context` | string | Pre-loaded context block (same as injected into system prompt) — useful if Cloud AI wants to customize the prompt |
+| `tool_definitions` | array | OpenAI function-calling schemas for all registered MCP tools — pass directly as the `tools` parameter in Cloud AI LLM calls, no hardcoding needed |
+| `tool_budget` | int | Number of tool calls allowed before Cloud AI should produce a final answer |
+| `total_files` | int | Total files in the library |
+| `date_range` | object | `min` and `max` creation dates |
+| `top_tags` | array | Top 200 most common tags, sorted by frequency |
 | `conversation_count` | int | Number of compacted conversations with embeddings |
 
-**3b. Action: `scoped_search`**
+---
 
-Runs date filtering (files only), tag filtering, and FAISS semantic ranking. Returns structured candidate data.
+**Action: `get_scoped_tags`**
+
+Returns the top-M tags from a date- and/or tag-scoped subset of the file library.
 
 **Request:**
 ```json
 {
-  "action": "scoped_search",
-  "rag_query": "beach vacation photos with family",
+  "action": "get_scoped_tags",
   "start_date": "2025-06-01",
   "end_date": "2025-06-30",
-  "tags": ["beach", "family", "vacation"],
-  "k": 8,
-  "embedding_model": null
+  "min_tags": ["beach"],
+  "strict": false,
+  "top_m": 50
 }
 ```
 
-**Request Parameters:**
-
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `action` | string | ✅ | — | Must be `"scoped_search"` |
-| `rag_query` | string | ✅ | — | Semantic search phrase for FAISS ranking |
-| `start_date` | string\|null | ❌ | null | Start date filter (YYYY-MM-DD). **Files only** — conversations are never date-filtered |
-| `end_date` | string\|null | ❌ | null | End date filter (YYYY-MM-DD). **Files only** — conversations are never date-filtered |
-| `tags` | array\|null | ❌ | null | Tag filter applied to both files and conversations |
-| `k` | int | ❌ | 8 | Max candidates to return (capped at 20) |
-| `embedding_model` | string\|null | ❌ | config default | Override embedding model for this search |
-
-**Important:** Conversation candidates (compacted chat summaries) are **exempt from date filtering**. They always participate in tag filtering and semantic ranking regardless of date range.
-
-**Status Messages:**
-```json
-{"type": "status", "message": "Filtering candidates..."}
-{"type": "status", "message": "Date filter: 45 file(s) (2025-06-01 to 2025-06-30)"}
-{"type": "status", "message": "Semantic ranking 45 file(s) + 8 conversation(s)..."}
-```
+| `start_date` | string\|null | ❌ | null | Inclusive start date (YYYY-MM-DD) |
+| `end_date` | string\|null | ❌ | null | Inclusive end date (YYYY-MM-DD) |
+| `min_tags` | array\|null | ❌ | null | Tag filter — files must match at least one (or all if `strict=true`) |
+| `strict` | bool | ❌ | false | `true` = all tags must match (AND logic); `false` = any tag matches (OR logic) |
+| `top_m` | int | ❌ | 50 | Number of top tags to return |
+| `budget_remaining` | int\|null | ❌ | null | Cloud AI's remaining tool call count **before** this call. Server appends `[Tool calls remaining: N]` to the result — same annotation the local deep-chat handler uses. |
 
 **Response:**
 ```json
 {
   "type": "result",
-  "message": "Found 8 candidate(s)",
+  "message": "Top 15 tags in scope (2025-06-01 → 2025-06-30, tags: beach):\nbeach, family, summer, ...\n\n[Tool calls remaining: 7]",
   "data": {
-    "candidates": [
-      {
-        "type": "file",
-        "fileName": "IMG_2847.jpg",
-        "creationTime": "2025-06-15T10:30:00Z",
-        "tags": ["beach", "family", "summer"],
-        "description": "Family playing on sandy beach with ocean in background",
-        "fileType": "image",
-        "formatted": "• IMG_2847.jpg\n  Date: 2025-06-15\n  Tags: beach, family, summer\n  Desc: Family playing on sandy beach..."
-      },
-      {
-        "type": "conversation",
-        "id": "conv_20250610",
-        "summary": "Discussed planning a beach vacation to Malibu in June...",
-        "tags": ["beach", "vacation", "malibu"],
-        "compacted_at": "2025-06-20T14:00:00Z",
-        "formatted": "• [Conversation conv_20250610]\n  Compacted: 2025-06-20\n  Keywords: beach, vacation, malibu\n  Facts: Discussed planning a beach vacation..."
-      }
-    ],
-    "file_count": 6,
-    "conv_count": 2
+    "tool": "get_scoped_tags",
+    "raw": "Top 15 tags in scope (2025-06-01 → 2025-06-30, tags: beach):\nbeach, family, summer, ...",
+    "budget_after": 7
   }
 }
 ```
 
-**Candidate Fields (type: file):**
+`data.raw` is always the unannotated result. Use `message` as the tool result string in the Cloud AI conversation.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `type` | string | Always `"file"` |
-| `fileName` | string | File name |
-| `creationTime` | string | ISO datetime of file creation |
-| `tags` | array | Tags assigned to the file |
-| `description` | string\|null | AI-generated description |
-| `fileType` | string | `"image"` or `"video"` |
-| `formatted` | string | Pre-formatted text block for LLM context injection |
+---
 
-**Candidate Fields (type: conversation):**
+**Action: `get_scoped_dates`**
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `type` | string | Always `"conversation"` |
-| `id` | string | Conversation ID |
-| `summary` | string | Compacted conversation summary |
-| `tags` | array | Keywords extracted from the summary |
-| `compacted_at` | string | ISO datetime of compaction |
-| `formatted` | string | Pre-formatted text block for LLM context injection |
+Returns the date ranges (and file counts) of files matching the given scope.
 
-**4. Client Can Send More Requests**
+**Request:**
+```json
+{
+  "action": "get_scoped_dates",
+  "start_date": "2025-01-01",
+  "end_date": "2025-12-31",
+  "min_tags": ["family"],
+  "strict": false,
+  "top_k": 10
+}
+```
 
-The connection stays open. Send additional `scoped_search` or `get_library_context` messages without reconnecting. This enables iterative Short Extraction rounds.
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `start_date` | string\|null | ❌ | null | Inclusive start date |
+| `end_date` | string\|null | ❌ | null | Inclusive end date |
+| `min_tags` | array\|null | ❌ | null | Tag filter |
+| `strict` | bool | ❌ | false | AND vs OR tag matching |
+| `top_k` | int | ❌ | 10 | Number of date clusters to return |
+| `budget_remaining` | int\|null | ❌ | null | Remaining tool calls before this call — server appends budget annotation to result. |
 
-**5. Connection Closes**
+**Response:**
+```json
+{
+  "type": "result",
+  "message": "Date ranges in scope:\n2025-06 (42 files)\n2025-08 (18 files)\n...\n\n[Tool calls remaining: 6]",
+  "data": {"tool": "get_scoped_dates", "raw": "...", "budget_after": 6}
+}
+```
 
-The client can disconnect at any time. The server cleans up automatically.
+---
+
+**Action: `scoped_rag_search`**
+
+Semantic search within a date/tag-scoped subset of files + conversations. `start_date`, `end_date`, and `min_tags` are **required** — this tool is designed for a targeted final retrieval step, not open-ended exploration.
+
+**Request:**
+```json
+{
+  "action": "scoped_rag_search",
+  "query": "beach vacation photos with family",
+  "start_date": "2025-06-01",
+  "end_date": "2025-06-30",
+  "min_tags": ["beach", "family"],
+  "strict": false,
+  "top_k": 5,
+  "embedding_model": null
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `query` | string | ✅ | — | Semantic search phrase for FAISS ranking |
+| `start_date` | string | ✅ | — | Inclusive start date (YYYY-MM-DD) |
+| `end_date` | string | ✅ | — | Inclusive end date (YYYY-MM-DD) |
+| `min_tags` | array | ✅ | — | Tag filter (at least one tag required) |
+| `strict` | bool | ❌ | false | AND vs OR tag matching |
+| `top_k` | int | ❌ | 5 | Number of top results to return |
+| `embedding_model` | string\|null | ❌ | config default | Override embedding model for this search |
+| `budget_remaining` | int\|null | ❌ | null | Remaining tool calls before this call — server appends budget annotation to result. |
+
+**Response:**
+```json
+{
+  "type": "result",
+  "message": "Top 5 results for 'beach vacation photos with family' (2025-06-01 → 2025-06-30, tags: beach, family):\n\n• IMG_2847.jpg\n  Date: 2025-06-15\n  Tags: beach, family, summer\n  Desc: Family playing on sandy beach...\n\n• [Conversation conv_20250610]\n  Compacted: 2025-06-20\n  Keywords: beach, vacation, malibu\n  Facts: Discussed planning a beach vacation to Malibu...\n\n[Tool calls remaining: 0 — generate your final answer now]",
+  "data": {"tool": "scoped_rag_search", "raw": "...", "budget_after": 0}
+}
+```
+
+The `message` string is pre-formatted and budget-annotated — use it directly as the tool result in the Cloud AI conversation. `data.raw` contains the unannotated text only.
+
+---
+
+**Action: `get_conversation_rag`**
+
+Semantic search across compacted conversation summaries only (no files).
+
+**Request:**
+```json
+{
+  "action": "get_conversation_rag",
+  "query": "trip planning for beach vacation",
+  "top_n": 5
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `query` | string | ✅ | — | Semantic search phrase |
+| `top_n` | int | ❌ | 5 | Number of top conversation matches to return |
+| `budget_remaining` | int\|null | ❌ | null | Remaining tool calls before this call — server appends budget annotation to result. |
+
+**Response:**
+```json
+{
+  "type": "result",
+  "message": "Top 3 relevant past conversations:\n\n[Conversation conv_20250610]\nCompacted: 2025-06-20\nKeywords: beach, vacation, malibu\nFacts: Discussed planning a beach vacation to Malibu in June...\n\n[Tool calls remaining: 5]",
+  "data": {"tool": "get_conversation_rag", "raw": "...", "budget_after": 5}
+}
+```
+
+---
+
+**Workflow for Cloud AI Deep Chat:**
+
+A Cloud AI implementing Deep Chat should follow this pattern:
+
+1. Connect to `/api/mcp`
+2. Receive ready message
+3. Send `get_library_context` (with the user's question)
+4. Use the returned `system_prompt` directly in your LLM call, or customize it as needed
+5. Run a multi-turn tool-calling loop using the 4 MCP tool actions (respecting `tool_budget`):
+   - Pass `budget_remaining` (decrementing from `tool_budget`) in every tool request — the server appends the same `[Tool calls remaining: N]` annotation the local agent sees
+   - Use `get_scoped_tags` / `get_scoped_dates` to explore the library scope
+   - Use `scoped_rag_search` for targeted retrieval
+   - Use `get_conversation_rag` to find relevant past conversations
+6. After each tool call, use the `message` field (top-level in the WebSocket JSON) as the tool result in the Cloud AI conversation (already includes the budget annotation)
+7. When `budget_after` reaches 0, or the LLM produces a final answer (no more tool calls), disconnect
+
+**Status messages** are sent before each tool execution:
+```json
+{"type": "status", "message": "Executing MCP tool: scoped_rag_search..."}
+```
+
+---
 
 **Error Cases:**
 
 ```json
+{"type": "error", "message": "RAG database not available. Generate RAG first using /generate-rag."}
+```
+
+```json
 {
   "type": "error",
-  "message": "RAG database not available. Generate RAG first using /generate-rag."
+  "message": "Unknown action: 'foo'. Use 'get_library_context', 'get_scoped_tags', 'get_scoped_dates', 'scoped_rag_search', or 'get_conversation_rag'."
 }
 ```
 
 ```json
 {
   "type": "error",
-  "message": "rag_query is required."
-}
-```
-
-```json
-{
-  "type": "error",
-  "message": "Unknown action: foo. Use 'get_library_context' or 'scoped_search'."
-}
-```
-
-```json
-{
-  "type": "error",
-  "message": "Scoped RAG search error: <ErrorType>: <details>",
+  "message": "Cloud Deep Chat error: <ErrorType>: <details>",
   "data": {"error_type": "...", "error_message": "...", "traceback": "..."}
 }
 ```
@@ -3452,7 +3467,7 @@ Currently no rate limits are enforced. Future versions may add:
 10. **Structured output:** Parse XML tags (`<think>`, `<conclusion>`, `<files>`) from chat, tag, and describe responses
 11. **Conversation memory:** Use `/api/compact-conversations` followed by `/api/generate-rag` to build conversation memories into the RAG index
 12. **Cloud AI workflow:** Use `/api/cloud-compact` when your client app performs summarization via a cloud LLM — the server embeds only, no local chat model required
-13. **Cloud Deep Chat:** Use `/api/scoped-rag-search` to let a cloud AI perform Deep Chat — see the [Deep Chat Cloud Build Guide](Documentation/DEEP_CHAT_CLOUD_GUIDE.md)
+13. **Cloud Deep Chat:** Use `/api/mcp` — it exposes the same 4 MCP tools (`get_scoped_tags`, `get_scoped_dates`, `scoped_rag_search`, `get_conversation_rag`) used by local deep-chat, so a Cloud AI can drive an identical tool-calling loop. See the [Deep Chat Cloud Build Guide](Documentation/DEEP_CHAT_CLOUD_GUIDE.md)
 
 ---
 

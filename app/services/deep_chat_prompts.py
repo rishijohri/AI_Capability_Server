@@ -1,172 +1,89 @@
-"""Deep Chat Prompts — All prompt templates and prompt-builder functions.
+"""Deep Chat Prompts — System prompt template and builder for MCP tool-calling loop.
 
-Separated from deep_chat_handler.py so logic and prompts are independently
-maintainable.  This file contains **only** prompt strings, the constants they
-reference, and thin builder functions that assemble them.
+The new design uses a single system prompt (no extraction/refinement/synthesis
+templates).  The agent receives pre-loaded global library context (tags, date
+range, and relevant past conversations) before its first tool call, so it can
+skip initial exploration calls when the global context is sufficient.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional
+
+# Injected when no library context is available
+_NO_CONTEXT_SECTION = "(No library context pre-loaded — use get_scoped_tags and get_scoped_dates to explore.)"
 
 # ---------------------------------------------------------------------------
-# Constants used exclusively by prompts
-# ---------------------------------------------------------------------------
-MAX_REFINEMENT_TAGS = 400     # Tags shown to LLM in refinement prompt
-
-
-# ---------------------------------------------------------------------------
-# LLM Call 1: Initial Parameter Extraction
+# Deep Chat System Prompt
 # ---------------------------------------------------------------------------
 
-EXTRACTION_TEMPLATE = """/no_think
-Extract search parameters from the user's question about their media library.
+DEEP_CHAT_SYSTEM_PROMPT = """You are Persona, a thorough AI assistant that searches a user's personal media library and conversation history to provide accurate, well-supported answers.
 
-LIBRARY TAGS ({tag_count} shown, {total_tags} total): {tags_str}{omitted_note}{conv_block}
-LIBRARY DATE RANGE: {min_date} to {max_date}
+You have access to {tool_call_budget} tool call(s) in total. Use them wisely.
 
-RESPOND EXACTLY:
-FILTER_ORDER:date_first or tags_first
-START_DATE:YYYY-MM-DD
-END_DATE:YYYY-MM-DD
-TAGS:tag1,tag2,tag3
-RAG_QUERY:semantic search phrase
-PLAN:one_step or two_step
+AVAILABLE TOOLS:
+- get_scoped_tags(start_date?, end_date?, min_tags?, top_m?): List the most common tags in a date/tag-scoped subset of the library. Use this early to understand what topics exist in a time range.
+- scoped_rag_search(query, start_date, end_date, min_tags, top_k?): Semantic search for media files. Requires a date range AND at least one tag — you MUST call get_scoped_dates and get_scoped_tags first to obtain these. Returns file names, dates, tags, and descriptions.
+- get_scoped_dates(start_date?, end_date?, min_tags?, top_k?): List contiguous date ranges with matching files, sorted by file count. Use this to find when events occurred.
+- get_conversation_rag(query, top_n?): Search past conversation summaries for relevant facts or context.
 
-RULES:
-- FILTER_ORDER: Choose date_first when question mentions a specific date/time. Choose tags_first when question is about a topic without specific date.
-- Dates: YYYY-MM-DD. Same date for both if asking about one day. Use none if no date mentioned.
-- TAGS: Pick from LIBRARY TAGS or CONVERSATION KEYWORDS above. Choose 3-10 that relate to the question topic.
-- RAG_QUERY: A descriptive search phrase to find relevant files semantically.
-- PLAN: one_step for most direct questions. two_step if the question requires a chain — e.g. first find an event to establish a date, then search for related items around that date.
-- Use none if not applicable.
-- Start response with FILTER_ORDER: immediately."""
+STRATEGY:
+1. You have been given PRE-LOADED LIBRARY CONTEXT below (global tags, overall date range, and relevant past conversations). Use it immediately:
+   - If the pre-loaded global date range and tags are sufficient to scope your search, skip get_scoped_dates and get_scoped_tags and call scoped_rag_search directly.
+   - Only call get_scoped_dates or get_scoped_tags when you need a NARROWER or MORE SPECIFIC subset than what was pre-loaded.
+2. Only call scoped_rag_search AFTER you have a concrete date range and relevant tags (either from the pre-loaded context or from get_scoped_dates/get_scoped_tags).
+3. Use get_conversation_rag when the question involves facts, preferences, or events from past conversations NOT already covered by the pre-loaded conversation results.
+4. Evaluate each result in your thinking before deciding the next action.
+5. If the budget is tight (2 calls or fewer total), use the pre-loaded context to go directly to scoped_rag_search.
+
+BUDGET RULES:
+- You have {tool_call_budget} tool call(s) total. Each call costs 1 from the budget.
+- Every tool result shows how many calls remain.
+- When 1 call remains, only scoped_rag_search will be available. Use it for a well-targeted final search.
+- When 0 calls remain, produce your final answer immediately. If data is sufficient, answer completely. If data is insufficient, tell the user what you found and what is still missing — do NOT fabricate information.
+
+QUALITY EVALUATION (required after every tool result):
+In your thinking, explicitly evaluate: Is this result sufficient to answer the question? What is missing? What should I search next given remaining budget?
+
+ANSWER FORMAT:
+- Reference specific file names, dates, and tags from search results.
+- If no relevant files were found, say so clearly. Do NOT invent file names or dates.
+- Keep the answer focused and factual.
+- Wrap your final answer in <conclusion>...</conclusion> tags.
+- List referenced file names (one per line) in <files>...</files> tags after the conclusion. Leave <files></files> empty if none.
+
+EXAMPLE OUTPUT FORMAT:
+<conclusion>
+Based on the search results, ...
+</conclusion>
+
+<files>
+photo_2024_01_15.jpg
+video_birthday.mp4
+</files>
+
+---
+PRE-LOADED LIBRARY CONTEXT:
+{library_context_section}
+---"""
 
 
-def build_extraction_prompt(
-    top_tags: List[str],
-    total_tags: int,
-    date_range: Tuple[str, str],
-    conv_tags: Optional[List[str]] = None,
+def build_deep_chat_system_prompt(
+    tool_call_budget: int,
+    library_context: Optional[str] = None,
 ) -> str:
-    """Assemble the extraction prompt with real library data."""
-    tags_str = ", ".join(top_tags)
-    omitted = total_tags - len(top_tags)
-    omitted_note = f"\n({omitted} additional less-common tags not shown)" if omitted > 0 else ""
+    """Build the deep-chat system prompt with the given tool call budget.
 
-    conv_block = ""
-    if conv_tags:
-        conv_tags_str = ", ".join(conv_tags[:100])
-        conv_block = f"\nCONVERSATION KEYWORDS ({len(conv_tags)} keywords from chat history): {conv_tags_str}"
+    Args:
+        tool_call_budget: Total number of tool calls the agent may make this session.
+        library_context: Pre-gathered library context string (global tags, date range,
+            relevant past conversations).  When provided, injected into the prompt so
+            the agent can skip initial exploration calls.
 
-    return EXTRACTION_TEMPLATE.format(
-        tag_count=len(top_tags),
-        total_tags=total_tags,
-        tags_str=tags_str,
-        omitted_note=omitted_note,
-        conv_block=conv_block,
-        min_date=date_range[0],
-        max_date=date_range[1],
-    )
-
-
-# ---------------------------------------------------------------------------
-# LLM Call 2: Refinement
-# ---------------------------------------------------------------------------
-
-REFINEMENT_TEMPLATE = """/no_think
-You filtered the media library and found {file_count} file(s){conv_info}.
-{date_info}
-Current selected tags: {current_tags_str}
-
-TAGS IN FILTERED CANDIDATES ({shown_count} shown, {total_filtered_tags} total): {tags_str}{omitted_note}
-
-Are you satisfied with the current filter to answer the user's question, or do you want to adjust?
-
-RESPOND EXACTLY:
-TAGS:tag1,tag2,tag3
-RAG_QUERY:semantic search query for the topic
-SATISFIED:yes or no
-
-RULES:
-- TAGS: Pick from the TAGS IN FILTERED CANDIDATES. Choose the most relevant ones (3-10).
-- RAG_QUERY: A descriptive phrase to semantically search within the filtered files.
-- SATISFIED:yes if the file set looks good, no if you want to filter more.
-- Start response with TAGS: immediately."""
-
-
-def build_refinement_prompt(
-    file_count: int,
-    filtered_tags: List[str],
-    total_filtered_tags: int,
-    current_params: Dict[str, Any],
-    conv_count: int = 0,
-) -> str:
-    """Assemble the refinement prompt showing tags within the filtered set."""
-    shown_count = min(len(filtered_tags), MAX_REFINEMENT_TAGS)
-    tags_str = ", ".join(filtered_tags[:MAX_REFINEMENT_TAGS])
-    omitted = total_filtered_tags - shown_count
-    omitted_note = f"\n({omitted} additional tags not shown)" if omitted > 0 else ""
-
-    current_tags_str = ", ".join(current_params["tags"]) if current_params["tags"] else "none"
-
-    if current_params["start_date"]:
-        date_info = f"Date range: {current_params['start_date']} to {current_params['end_date']}"
-    else:
-        date_info = "Date range: not specified"
-
-    conv_info = f" + {conv_count} conversation(s)" if conv_count > 0 else ""
-
-    return REFINEMENT_TEMPLATE.format(
-        file_count=file_count,
-        conv_info=conv_info,
-        date_info=date_info,
-        current_tags_str=current_tags_str,
-        shown_count=shown_count,
-        total_filtered_tags=total_filtered_tags,
-        tags_str=tags_str,
-        omitted_note=omitted_note,
-    )
-
-
-# ---------------------------------------------------------------------------
-# LLM Call 3: Answer Synthesis (with Short Extraction awareness)
-# ---------------------------------------------------------------------------
-
-SYNTHESIS_TEMPLATE = """/no_think
-You are Persona. Answer the user's question using ONLY the data below.
-Context may include media files and past conversation summaries (labeled 'Conversation').
-
-RULES:
-- Start your answer immediately. Do NOT use <think> tags.
-- Reference specific file names, dates, tags, descriptions, or conversation facts from the data if helpful.
-- If the data IS SUFFICIENT, answer directly and completely.{short_extraction_block}"""
-
-_SHORT_EXTRACTION_AVAILABLE = """
-- If the data is INSUFFICIENT to answer confidently, you may request a Short Extraction — a targeted follow-up search with different parameters. You have {remaining} Short Extraction(s) remaining.
-  To request one, output EXACTLY this block first (before any explanation):
-
-SHORT_EXTRACTION
-START_DATE:YYYY-MM-DD or none
-END_DATE:YYYY-MM-DD or none
-TAGS:tag1,tag2,tag3 or none
-RAG_QUERY:focused phrase for the missing information
-INSIGHT:one sentence summarizing what you learned so far from this extraction
-
-  Then on the next line explain what specific information is still missing.
-  INSIGHT is important — it carries your findings forward to the next search round."""
-
-_SHORT_EXTRACTION_EXHAUSTED = """
-- This is the final answer. Do NOT request further searches. If data is still insufficient, say what you found and what is missing."""
-
-
-def build_synthesis_prompt(remaining_short_extractions: int = 0) -> str:
-    """Assemble the synthesis prompt.
-
-    When ``remaining_short_extractions > 0`` the AI is told it can trigger a
-    Short Extraction cycle.  When 0, it must answer with whatever data it has.
+    Returns:
+        Formatted system prompt string.
     """
-    if remaining_short_extractions > 0:
-        block = _SHORT_EXTRACTION_AVAILABLE.format(remaining=remaining_short_extractions)
-    else:
-        block = _SHORT_EXTRACTION_EXHAUSTED
+    context_section = library_context.strip() if library_context else _NO_CONTEXT_SECTION
+    return DEEP_CHAT_SYSTEM_PROMPT.format(
+        tool_call_budget=tool_call_budget,
+        library_context_section=context_section,
+    )
 
-    return SYNTHESIS_TEMPLATE.format(short_extraction_block=block)

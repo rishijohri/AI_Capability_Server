@@ -160,7 +160,11 @@ async def get_configuration():
         model_directory=config.model_directory,
         binary_config=config.binary_config,
         system_info=config.system_info,
-        available_binary_configs=config.get_available_binary_configs()
+        available_binary_configs=config.get_available_binary_configs(),
+        tool_history_max_tags=config.tool_history_max_tags,
+        tool_history_max_results=config.tool_history_max_results,
+        max_tags_per_scope=config.max_tags_per_scope,
+        max_dates_per_scope=config.max_dates_per_scope,
     )
 
 
@@ -196,7 +200,11 @@ async def update_configuration(request: ConfigUpdateRequest):
         model_directory=config.model_directory,
         binary_config=config.binary_config,
         system_info=config.system_info,
-        available_binary_configs=config.get_available_binary_configs()
+        available_binary_configs=config.get_available_binary_configs(),
+        tool_history_max_tags=config.tool_history_max_tags,
+        tool_history_max_results=config.tool_history_max_results,
+        max_tags_per_scope=config.max_tags_per_scope,
+        max_dates_per_scope=config.max_dates_per_scope,
     )
 
 
@@ -2063,7 +2071,10 @@ async def chat_ws(websocket: WebSocket):
                 WebSocketMessage(
                     type="files",
                     message=files_content,
-                    data={"relevant_files": files_list or [f.fileName for f in relevant_files]}
+                    data={"relevant_files": files_list or [
+                        r.file_metadata.fileName if hasattr(r, 'file_metadata') and r.file_metadata else r.identifier
+                        for r in relevant_files
+                    ]}
                 ).to_json()
             )
             sent_any = True
@@ -2505,12 +2516,14 @@ async def compact_conversations_ws(websocket: WebSocket):
                 ).to_json()
             )
             
-            # Build conversation text
+            # Build conversation text — user messages only to avoid
+            # agent hallucinations contaminating the memory summary
             messages_list = conversation_map[conv_id]
             if isinstance(messages_list, list):
                 conv_text = "\n".join(
-                    f"{m.get('role', 'unknown')}: {m.get('content', '')}"
+                    m.get('content', '')
                     for m in messages_list
+                    if m.get('role') == 'user' and m.get('content', '').strip()
                 )
             else:
                 conv_text = str(messages_list)
@@ -2905,15 +2918,16 @@ async def deep_chat_ws(websocket: WebSocket):
         
         # NO initial RAG search — the LLM controls all data access through tools
         
-        # Load the chat model for extraction/refinement (text model, no mmproj)
+        # Load the chat model with thinking mode for deep chat
         await websocket.send_json(
             WebSocketMessage(
                 type="status",
                 message=f"Loading chat model {chat_model}..."
             ).to_json()
         )
-        
-        await llm_service.load_model(chat_model)
+
+        enable_thinking = getattr(config.llm_params, "enable_thinking", True)
+        await llm_service.load_model(chat_model, enable_thinking=enable_thinking)
         
         # Send chat model startup command
         chat_startup_cmd = llm_service.get_startup_command()
@@ -2988,33 +3002,63 @@ async def deep_chat_ws(websocket: WebSocket):
         await websocket.close()
 
 
-@router.websocket("/scoped-rag-search")
-async def scoped_rag_search_ws(websocket: WebSocket):
-    """Scoped RAG Search — Enables Cloud AI to perform Deep Chat.
+@router.websocket("/mcp")
+async def mcp_tools_ws(websocket: WebSocket):
+    """Cloud AI Deep Chat — MCP Tool Endpoint.
 
-    Accepts a JSON message with search parameters and returns the filtered,
-    semantically ranked candidates (files + conversations) as structured data
-    the calling Cloud AI can use for synthesis.
+    Exposes the same MCP tools used by the local /deep-chat loop so that a
+    Cloud AI client can drive its own agentic search session.
 
-    The endpoint also supports a ``get_library_context`` action which returns
-    library tags, conversation keywords, and date range so the Cloud AI can
-    build its own extraction prompt.
+    Actions available (persistent multi-message connection):
 
     --- get_library_context ---
-    Request:  {"action": "get_library_context"}
-    Response: {type: "result", data: {top_tags, total_tags, conv_tags, date_range}}
+    Returns global library overview (tags, date range, conversation count) and
+    top relevant past conversations for the given query — identical to what the
+    local deep-chat agent receives in its system prompt.
 
-    --- scoped_search ---
-    Request:  {
-        "action": "scoped_search",
-        "rag_query": "semantic search phrase",
-        "start_date": "YYYY-MM-DD" | null,
-        "end_date": "YYYY-MM-DD" | null,
-        "tags": ["tag1", "tag2"] | null,
-        "k": 8,
-        "embedding_model": null
-    }
-    Response: {type: "result", data: {candidates: [...], file_count, conv_count}}
+    Request:  {"action": "get_library_context", "query": "<user question>"}
+    Response: {type: "result", data: {library_overview, conversation_context,
+                                       total_files, date_range, top_tags}}
+
+    --- get_scoped_tags ---
+    Mirrors the MCP get_scoped_tags tool.  Returns top tags from a scoped subset.
+
+    Request:  {"action": "get_scoped_tags",
+               "start_date": "YYYY-MM-DD"|null,
+               "end_date": "YYYY-MM-DD"|null,
+               "min_tags": [...]|null,
+               "strict": false,
+               "top_m": 50}
+
+    --- get_scoped_dates ---
+    Mirrors the MCP get_scoped_dates tool.
+
+    Request:  {"action": "get_scoped_dates",
+               "start_date": "YYYY-MM-DD"|null,
+               "end_date": "YYYY-MM-DD"|null,
+               "min_tags": [...]|null,
+               "strict": false,
+               "top_k": 10}
+
+    --- scoped_rag_search ---
+    Mirrors the MCP scoped_rag_search tool.  Requires start_date, end_date, min_tags.
+
+    Request:  {"action": "scoped_rag_search",
+               "query": "...",
+               "start_date": "YYYY-MM-DD",
+               "end_date": "YYYY-MM-DD",
+               "min_tags": ["tag1"],
+               "strict": false,
+               "top_k": 5,
+               "embedding_model": null}
+
+    --- get_conversation_rag ---
+    Mirrors the MCP get_conversation_rag tool.
+
+    Request:  {"action": "get_conversation_rag", "query": "...", "top_n": 5}
+
+    All tool actions return: {type: "result", message: "<tool text output>",
+                              data: {"tool": "<action>", "raw": "<same text>"}}
     """
     await websocket.accept()
     llm_service = None
@@ -3047,8 +3091,22 @@ async def scoped_rag_search_ws(websocket: WebSocket):
         if not compaction_service.is_loaded():
             compaction_service.load()
 
+        # Build MCPToolRegistry — the same object used by the local deep-chat loop
+        from app.services.mcp_tools import MCPToolRegistry
+        from app.services.deep_chat_handler import _build_library_context
+
+        embedding_model = config.embedding_model
+        tool_registry = MCPToolRegistry(
+            metadata_store=metadata_store,
+            llm_service=llm_service,
+            embedding_model=embedding_model,
+            chat_model=config.chat_model,
+            compaction_service=compaction_service,
+            config=config,
+        )
+
         await websocket.send_json(
-            WebSocketMessage(type="status", message="Scoped RAG Search ready.").to_json()
+            WebSocketMessage(type="status", message="Cloud Deep Chat MCP tools ready.").to_json()
         )
 
         # --------------- message loop ---------------
@@ -3058,169 +3116,134 @@ async def scoped_rag_search_ws(websocket: WebSocket):
             except WebSocketDisconnect:
                 break
 
-            action = msg_data.get("action", "scoped_search")
+            action = msg_data.get("action", "")
 
             # -------- get_library_context --------
             if action == "get_library_context":
-                from app.services.deep_chat_handler import (
-                    _get_library_tags_and_dates,
+                query = msg_data.get("query", "")
+                # Reuse the same helper the local deep-chat uses to pre-load context
+                ctx = await _build_library_context(
+                    user_message=query,
+                    tool_registry=tool_registry,
+                    metadata_store=metadata_store,
+                    config=config,
                 )
-                top_tags, total_tags, conv_tags, date_range = _get_library_tags_and_dates(
-                    metadata_store, compaction_service
-                )
+                # Also send structured date range + file count for programmatic use
                 all_meta = metadata_store.get_all_metadata()
+                dates = []
+                from collections import Counter as _Counter
+                from datetime import datetime as _dt
+                tag_counter = _Counter()
+                for m in all_meta:
+                    try:
+                        if m.creationTime:
+                            d = _dt.fromisoformat(m.creationTime.replace("Z", "+00:00")).replace(tzinfo=None)
+                            dates.append(d)
+                    except (ValueError, AttributeError):
+                        pass
+                    for t in (m.tags or []):
+                        tag_counter[t.lower()] += 1
+                date_range = {
+                    "min": str(min(dates).date()) if dates else None,
+                    "max": str(max(dates).date()) if dates else None,
+                }
+                top_tags = [t for t, _ in tag_counter.most_common(200)]
 
-                # Conversation summary count
                 conv_data = compaction_service.get_all_data()
                 conv_count = sum(1 for d in conv_data.values() if d.get("embedding"))
+
+                # Build the full system prompt (with library context injected)
+                from app.services.deep_chat_prompts import build_deep_chat_system_prompt
+                tool_budget = config.chat_rounds  # Budget for Cloud AI (same as local deep-chat)
+                system_prompt = build_deep_chat_system_prompt(
+                    tool_call_budget=tool_budget,
+                    library_context=ctx
+                )
 
                 await websocket.send_json(
                     WebSocketMessage(
                         type="result",
                         message="Library context retrieved",
                         data={
+                            "system_prompt": system_prompt,
+                            "library_context": ctx,
+                            "tool_definitions": tool_registry.get_tool_definitions(),
+                            "tool_budget": tool_budget,
+                            "total_files": len(all_meta),
+                            "date_range": date_range,
                             "top_tags": top_tags,
-                            "total_tags": total_tags,
-                            "conv_tags": conv_tags,
-                            "date_range": {"min": date_range[0], "max": date_range[1]},
-                            "file_count": len(all_meta),
                             "conversation_count": conv_count,
                         }
                     ).to_json()
                 )
                 continue
 
-            # -------- scoped_search --------
-            if action == "scoped_search":
-                rag_query = msg_data.get("rag_query", "")
-                start_date = msg_data.get("start_date")
-                end_date = msg_data.get("end_date")
-                tags = msg_data.get("tags")
-                k = min(msg_data.get("k", 8), 20)  # cap at 20
-                embedding_model = msg_data.get("embedding_model") or config.embedding_model
+            # -------- MCP tool actions --------
+            TOOL_ACTIONS = {
+                "get_scoped_tags", "scoped_rag_search",
+                "get_scoped_dates", "get_conversation_rag",
+            }
 
-                if not rag_query:
-                    await websocket.send_json(
-                        WebSocketMessage(type="error", message="rag_query is required.").to_json()
-                    )
-                    continue
+            if action in TOOL_ACTIONS:
+                # Resolve embedding model override
+                embedding_override = msg_data.pop("embedding_model", None)
+                if embedding_override:
+                    tool_registry.embedding_model = embedding_override
 
-                from app.services.deep_chat_handler import (
-                    _filter_by_date,
-                    _filter_by_tags,
-                    _scoped_rag_search,
-                    _format_candidate_for_context,
-                    ConversationCandidate,
-                )
+                # Budget annotation — Cloud AI passes how many calls it has left
+                # so the server can append the same annotation the local loop uses.
+                budget_remaining = msg_data.get("budget_remaining")
 
-                await websocket.send_json(
-                    WebSocketMessage(type="status", message="Filtering candidates...").to_json()
-                )
-
-                all_meta = metadata_store.get_all_metadata()
-                file_candidates = list(all_meta)
-
-                # Date filter
-                if start_date and end_date:
-                    date_filtered = _filter_by_date(all_meta, start_date, end_date)
-                    if date_filtered:
-                        file_candidates = date_filtered
-                        await websocket.send_json(
-                            WebSocketMessage(
-                                type="status",
-                                message=f"Date filter: {len(file_candidates)} file(s) ({start_date} to {end_date})"
-                            ).to_json()
-                        )
-
-                # Build conversation candidates
-                conv_candidates = [
-                    ConversationCandidate(
-                        conv_id=cid,
-                        summary=d.get("summary", ""),
-                        tags=d.get("tags", []),
-                        compacted_at=d.get("compactedAt", ""),
-                    )
-                    for cid, d in compaction_service.get_all_data().items()
-                    if d.get("embedding")
-                ]
-
-                # Tag filter
-                if tags:
-                    tag_filtered_files = _filter_by_tags(file_candidates, tags)
-                    if tag_filtered_files:
-                        file_candidates = tag_filtered_files
-                    tag_filtered_convs = _filter_by_tags(conv_candidates, tags)
-                    if tag_filtered_convs:
-                        conv_candidates = tag_filtered_convs
-
-                all_candidates = file_candidates + conv_candidates
+                # Strip non-tool keys — remaining keys are tool arguments
+                arguments = {
+                    k: v for k, v in msg_data.items()
+                    if k not in ("action", "budget_remaining")
+                }
 
                 await websocket.send_json(
                     WebSocketMessage(
                         type="status",
-                        message=f"Semantic ranking {len(file_candidates)} file(s) + {len(conv_candidates)} conversation(s)..."
+                        message=f"Executing MCP tool: {action}..."
                     ).to_json()
                 )
 
-                # Scoped RAG search
-                ranked = await _scoped_rag_search(
-                    filtered_candidates=all_candidates,
-                    query=rag_query,
-                    k=k,
-                    llm_service=llm_service,
-                    embedding_model=embedding_model,
-                    metadata_store=metadata_store,
-                    compaction_service=compaction_service,
-                )
+                result_text = await tool_registry.execute_tool(action, arguments)
 
-                # Format results
-                result_items = []
-                result_file_count = 0
-                result_conv_count = 0
-                for c in ranked:
-                    if isinstance(c, ConversationCandidate):
-                        result_conv_count += 1
-                        result_items.append({
-                            "type": "conversation",
-                            "id": c.conv_id,
-                            "summary": c.summary,
-                            "tags": c.tags,
-                            "compacted_at": c.compacted_at,
-                            "formatted": _format_candidate_for_context(c),
-                        })
+                # Restore default embedding model
+                tool_registry.embedding_model = embedding_model
+
+                # Append budget annotation (same format as local deep-chat handler)
+                if budget_remaining is not None:
+                    budget_after = int(budget_remaining) - 1
+                    if budget_after <= 0:
+                        result_with_budget = result_text + "\n\n[Tool calls remaining: 0 — generate your final answer now]"
                     else:
-                        result_file_count += 1
-                        result_items.append({
-                            "type": "file",
-                            "fileName": c.fileName,
-                            "creationTime": c.creationTime,
-                            "tags": c.tags,
-                            "description": c.description,
-                            "fileType": c.type,
-                            "formatted": _format_candidate_for_context(c),
-                        })
+                        result_with_budget = result_text + f"\n\n[Tool calls remaining: {budget_after}]"
+                else:
+                    result_with_budget = result_text
 
                 await websocket.send_json(
                     WebSocketMessage(
                         type="result",
-                        message=f"Found {len(ranked)} candidate(s)",
+                        message=result_with_budget,
                         data={
-                            "candidates": result_items,
-                            "file_count": result_file_count,
-                            "conv_count": result_conv_count,
-                        }
+                            "tool": action,
+                            "raw": result_text,
+                            "budget_after": (int(budget_remaining) - 1) if budget_remaining is not None else None,
+                        },
                     ).to_json()
                 )
-
-                # Unload embedding model after search
-                await llm_service.unload_model()
                 continue
 
             # -------- unknown action --------
             await websocket.send_json(
                 WebSocketMessage(
                     type="error",
-                    message=f"Unknown action: {action}. Use 'get_library_context' or 'scoped_search'."
+                    message=(
+                        f"Unknown action: '{action}'. "
+                        "Use 'get_library_context', 'get_scoped_tags', 'get_scoped_dates', "
+                        "'scoped_rag_search', or 'get_conversation_rag'."
+                    )
                 ).to_json()
             )
 
@@ -3236,7 +3259,7 @@ async def scoped_rag_search_ws(websocket: WebSocket):
             await websocket.send_json(
                 WebSocketMessage(
                     type="error",
-                    message=f"Scoped RAG search error: {type(e).__name__}: {str(e)}",
+                    message=f"Cloud Deep Chat error: {type(e).__name__}: {str(e)}",
                     data=error_details,
                 ).to_json()
             )
