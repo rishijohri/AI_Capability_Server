@@ -15,6 +15,23 @@ from app.utils import get_process_manager
 # Global lock to ensure only one model is active at a time
 _model_lock = asyncio.Lock()
 
+# Windows NTSTATUS 0xC0000135 — the OS could not locate a required DLL.
+# GPU-accelerated llama.cpp builds link against external runtime DLLs
+# (e.g. vulkan-1.dll, CUDA/HIP/SYCL runtimes).  When those DLLs are absent
+# the process exits immediately with this code.
+# Python exposes the raw unsigned DWORD, so it appears as 3221225781.
+_WIN_STATUS_DLL_NOT_FOUND = 0xC0000135  # 3221225781
+
+_WIN_DLL_NOT_FOUND_HINT = (
+    "\nHint: Exit code 0xC0000135 (STATUS_DLL_NOT_FOUND) means "
+    "the llama-server binary could not find a required DLL "
+    "(e.g. vulkan-1.dll, CUDA/HIP/SYCL runtime DLLs). "
+    "The selected binary configuration may require GPU runtime "
+    "libraries that are not installed on this machine. "
+    "Install the required GPU drivers/runtime or ensure the "
+    "CPU-only binary configuration is selected instead."
+)
+
 # On Windows, suppress console window popups for spawned subprocesses.
 # CREATE_NO_WINDOW prevents console creation; STARTUPINFO+SW_HIDE hides
 # any window the child process may try to show.
@@ -180,10 +197,20 @@ class LlamaServerBackend(LLMBackend):
                     _, stderr_output = proc.communicate(timeout=5)
                 except Exception:
                     stderr_output = "(unable to read stderr)"
+
+                # Provide a targeted explanation for the missing-DLL failure
+                # that is commonly seen with GPU-accelerated builds on Windows.
+                extra_hint = ""
+                if platform.system() == "Windows":
+                    exit_code_u32 = exit_code & 0xFFFFFFFF
+                    if exit_code_u32 == _WIN_STATUS_DLL_NOT_FOUND:
+                        extra_hint = _WIN_DLL_NOT_FOUND_HINT
+
                 raise RuntimeError(
                     f"llama-server exited immediately with code {exit_code}.\n"
                     f"Command: {self.get_startup_command()}\n"
                     f"Stderr: {stderr_output[-2000:] if stderr_output else '(empty)'}"
+                    f"{extra_hint}"
                 )
             
             # --- Poll health endpoint ---
